@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Read the troubleshooting guide first (most problems are already answered)
+    url: https://github.com/BOWLUNA/dsh-custom-mode/blob/main/docs/TROUBLESHOOTING.md
+    about: A dsh that will not start after installing, pnpm failing under WSL, a settings page that never appears, a mode missing from the picker, a rejected save — each with symptoms, cause and a way out.
+  - name: Where the conclusions come from (measurement log)
+    url: https://github.com/BOWLUNA/dsh-custom-mode/blob/main/docs/MEASUREMENTS.md
+    about: The raw commands and output behind the install, security, save-path, hot-reload and i18n claims, ready to re-run.
+  - name: 中文文档
+    url: https://github.com/BOWLUNA/dsh-custom-mode/blob/main/README.zh.md
+    about: Every document in this repository also has a Chinese twin — README.zh.md, docs/ARCHITECTURE.zh.md, docs/TROUBLESHOOTING.zh.md, docs/MEASUREMENTS.zh.md, docs/PUBLISHING.zh.md.

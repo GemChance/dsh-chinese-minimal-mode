@@ -1,51 +1,17 @@
-# Register an additional Web agent preset. It follows the official Minimal
-# composition: a complete persona plus one persistent platform shell.
+# Bundle patch for dsh-chinese-minimal-mode: inserts the 自定义模式 settings page row.
+#
+# A bundle patch inserts new rows; the profile's own cordis.patch.yml can only
+# replace rows that already exist by id, which is why this row has to originate
+# here rather than in the profile file.
+#
+# The plugin provides no Cordis service. It registers one private HTTP route
+# (`/custom-mode`), and naming the package in the root loader is also
+# what makes `dsh-client-modules` discover this package's `dsh.client`
+# declaration and serve `client.js` to the page.
+#
+# Deleting this file's bundle entry (or removing the package from the profile)
+# removes the Settings page completely; nothing else in the harness references
+# it, and no agent preset depends on it.
 - insert:
-    - id: preset-chinese-minimal
-      name: '@deepseek-ai/dsh-agent-preset'
-      config:
-        id: chinese-minimal
-        name: 中文极简模式
-        description: 极简工具集；完整系统提示词由 ~/.dsh/prompts/chinese-assistant.md 指定。
-        order: 5
-        plugins:
-          - id: persona
-            name: 'dsh-chinese-minimal-mode/prompt-reader'
-            config:
-              complete: true
-              includeRuntimeContext: false
-          - id: persistent-shell
-            name: cordis:group
-            group: true
-            isolate:
-              terminals: true
-            config:
-              - id: pty
-                name: '@deepseek-ai/dsh-terminal'
-              - id: terminal-bash
-                name: '@deepseek-ai/dsh-terminal-bash'
-                disabled: !!js process.platform === 'win32'
-                config:
-                  timeoutMs: 300000
-              - id: persistent-bash
-                name: '@deepseek-ai/dsh-tool-bash-persistent'
-                disabled: !!js process.platform === 'win32'
-                config:
-                  timeoutMs: 300000
-                  description: |-
-                    Run commands in a persistent bash shell.
-                    Keep output concise and run long-lived processes in the background.
-              - id: terminal-pwsh
-                name: '@deepseek-ai/dsh-terminal-bash'
-                disabled: !!js process.platform !== 'win32'
-                config:
-                  shellDialect: pwsh
-                  timeoutMs: 300000
-              - id: persistent-pwsh
-                name: '@deepseek-ai/dsh-tool-pwsh-persistent'
-                disabled: !!js process.platform !== 'win32'
-                config:
-                  timeoutMs: 300000
-                  description: |-
-                    Run commands in a persistent PowerShell session.
-                    Keep output concise and run long-lived processes in the background.
+    - id: custom-mode
+      name: dsh-chinese-minimal-mode

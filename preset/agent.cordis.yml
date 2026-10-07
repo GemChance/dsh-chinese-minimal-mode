@@ -1,0 +1,65 @@
+# 本文件由「自定义模式」设置页生成，请勿手工编辑——下次保存会覆盖。
+# 助手: 自定义模式 (custom)
+# 基础模式: minimal
+# 生成时间: 2026-10-07T15:11:07.483Z
+#
+# 每一行都是原样复制的官方 preset 行，只有 disable 状态会被改写；
+# 未被你切换过的行保持出厂状态（含 !!js 平台条件与默认关闭行）。
+# 生成时间戳同时用于让 agent-presets 检测到变化并重新挂载（它只比对 mtime 与 size）。
+# 本模式的身份来自 prompt.md（由本插件的 prompt-reader.mjs 每步重新读取）。
+- id: persona
+  name: './prompt-reader.mjs'
+  config:
+    # Omitted `path` defaults to prompt.md beside the module.
+    complete: true
+- id: persistent-shell
+  name: cordis:group
+  group: true
+  isolate:
+    terminals: true
+  config:
+    - id: pty
+      name: '@deepseek-ai/dsh-terminal'
+    - id: terminal-bash
+      name: '@deepseek-ai/dsh-terminal-bash'
+      disabled: !!js process.platform === 'win32'
+      config:
+        timeoutMs: 300000
+    - id: persistent-bash
+      name: '@deepseek-ai/dsh-tool-bash-persistent'
+      disabled: !!js process.platform === 'win32'
+      config:
+        timeoutMs: 300000
+        description: |-
+          Run commands in a bash shell
+          * When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.
+          * Network access depends on the task environment. Prefer configured mirrors/proxies when they are available.
+          * State is persistent across command calls and discussions with the user.
+          * To inspect a particular line range of a file, e.g. lines 10-25, try 'sed -n 10,25p /path/to/the/file'.
+          * Please avoid commands that may produce a very large amount of output.
+          * Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.
+    - id: terminal-pwsh
+      name: '@deepseek-ai/dsh-terminal-bash'
+      disabled: !!js process.platform !== 'win32'
+      config:
+        shellDialect: pwsh
+        timeoutMs: 300000
+    - id: persistent-pwsh
+      name: '@deepseek-ai/dsh-tool-pwsh-persistent'
+      disabled: !!js process.platform !== 'win32'
+      config:
+        timeoutMs: 300000
+        description: |-
+          Run commands in a PowerShell shell
+          * When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.
+          * You don't have access to the internet via this tool.
+          * State is persistent across command calls and discussions with the user.
+          * Use native Windows paths (C:\...) and $env:NAME variables; this is PowerShell, not bash.
+          * Please avoid commands that may produce a very large amount of output.
+          * Please run long lived commands in the background, e.g. 'Start-Job' or start a server with Start-Process.
+# 无浏览器时的改提示词通道（模型工具 custom_prompt）。
+- id: custom-prompt-tool
+  name: './prompt-tool.mjs'
+  config:
+    # 让工具描述报出本助手的名字；不认识这一行的旧版模块会忽略它。
+    modeName: "自定义模式"

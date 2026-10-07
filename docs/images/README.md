@@ -1,0 +1,68 @@
+# Screenshots
+
+Five images used in the README are **800×400**, cropped inside the settings dialog so the 2×2 grid is one size and has no letterbox. Maximum frame is 800×800.
+
+```
+01-mode-switch.png        800x800   Settings -> Custom mode: mode name + the FIVE base modes
+02-plugin-switches.png    800x800   Plugin switches: flat rows, 1px dividers, tri-state badges
+03-system-prompt.png      800x800   The system prompt editor + change history
+04-preset-picker.png      800x800   The new-session mode picker: the custom modes are listed
+05-assistant-manager.png  800x800   The assistant section, dropdown CLOSED, two assistants
+```
+
+`01` is where the fifth base mode is visible: the pill row reads **Standard / PTC / Minimal / Creator /
+All shipped rows**. Re-shoot `01` and `04` whenever that set changes.
+
+`04` is the one image that is **not** cropped with the shared `PANEL` box. The settings dialog is the panel
+itself, so a fixed box hugs it; the mode picker instead hangs off the **vertically centred** composer, and
+the same box left roughly 320 of the 800 rows as plain background. It now widens the viewport and aims an
+800x800 box at the popup's own centre (still 800x800, so the README table stays flush).
+
+None of them is hand-taken, and none of them carries anybody s private state: they are produced by
+[`tools/screenshots/shoot-fresh.mjs`](../../tools/screenshots/shoot-fresh.mjs) against a **throwaway
+`DSH_HOME` with no sessions**, with a fixed viewport (1440x900, device scale 1) and a fixed crop, and the
+script renames the seeded assistant and creates a second one so the images match the README they illustrate:
+
+```sh
+# a throwaway home (no sessions, no records) + a CDP browser
+systemd-run --unit=dsh-shots --collect -p MemoryMax=900M \
+  -p WorkingDirectory=/root/dsh-lab --setenv=DSH_HOME=/tmp/dsh-shots dsh web --port 3082 --no-open
+CDP_PORT=9222 node tools/screenshots/shoot-fresh.mjs "<token URL>" docs/images
+```
+
+`screenshots.json` at the repository root lists five of these files — the four above plus
+`05-assistant-manager.png` — as the storefront set catalogues read, so a catalogue card shows exactly
+the pictures this README shows: one capture run, one copy of each. (Before 1.10.0 there was a second,
+duplicated `editor/assets/storefront-*` set, and its first file was mislabelled — the entry named
+"assistant manager" actually held the mode-switch capture. That copy is gone.)
+
+Two measured traps are recorded in the script, because both produced 01-04 that looked plausible and were
+wrong: the settings dialog must be opened with a **real pointer** (this shell deliberately ignores synthesised
+`click()` for some controls), and the first-run **Add an API key modal is also a `[role=dialog]`** - a script
+that treats "a dialog exists" as "settings is open" spends the whole run looking for the sidebar inside that
+modal, and every page shot silently becomes the same picture.
+
+The rendered page is what [`tools/browser-verify.mjs`](../../tools/browser-verify.mjs) checks (74 checks,
+including the official metrics these images show); `observed.json` next to the older capture script records
+the state that run verified (theme, language, what the save returned, the mode list, the toggle it flipped).
+
+One file here is **not** shown in the READMEs: `social-preview.png` (1280x640). It is the GitHub repository s
+social preview image, and it can only be uploaded through the web UI (Settings -> Social preview) - the REST
+API has no endpoint for it. It is generated the same way the others are: rendered in a browser and captured at
+1280x640, so the source of truth stays in the repository. Verify which one is live with:
+
+```sh
+curl -sL https://github.com/BOWLUNA/dsh-custom-mode | grep -o 'og:image" content="[^"]*'
+```
+
+The READMEs reference these file names by absolute `raw.githubusercontent.com` URL (the npm storefront renders
+the same files, which is why they are not relative paths), so **renaming one means updating the docs**:
+
+```markdown
+![Mode name and base mode](https://raw.githubusercontent.com/BOWLUNA/dsh-custom-mode/main/docs/images/01-mode-switch.png)
+```
+
+`header.png` is the repository banner, 1280×640, rendered from `header.html` with headless Chrome.
+`header@2x.png` is the same artwork at 2560×1280. The banner does not name a plugin version.
+`social-preview.png` is the same 1280×640 frame for GitHub's social preview (Settings → Social preview;
+the API cannot set it).

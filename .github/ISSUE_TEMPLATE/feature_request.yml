@@ -1,0 +1,34 @@
+name: Feature request
+description: Something this mode should do, or should stop doing
+title: '[feature] '
+labels: ['enhancement']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This plugin leans on dsh-internal APIs (the README has a coupling-point table), so it helps to
+        say whether the request is doable with the **existing APIs** — that saves a round of
+        feasibility back-and-forth.
+
+  - type: textarea
+    id: need
+    attributes:
+      label: What you want
+      description: Describe the outcome in a sentence or two; no need to design the implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it is not possible today
+      description: How do you work around it now, and where does the workaround break down?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered or tried
+    validations:
+      required: false

@@ -1,0 +1,258 @@
+# 每次 push / PR 都对着**真实的出厂 preset** 跑一遍编译器测试。
+#
+# 为什么 CI 里要装一遍 dsh：`composition.mjs` 做的是对官方 preset 文本的手术，
+# 出厂文本本身不在本仓库里。装了 dsh 才能拿到那份文本，测出来的才是真结论 ——
+# 否则 CI 只能跑一个自己构造的假 fixture，等于什么都没测。
+#
+# 版本与根 `package.json` 的 version 保持一致；升 dsh 时这里也要改。
+name: test
+
+# 最小权限：这个 workflow 只读代码、跑测试，不需要写任何东西。
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        # 20 是保守下限（只用标准库），24 是当前开发版本。
+        node-version: ['20', '24']
+        # 支持策略（2026-10-03 更新）：**两条"最新的"各占一条腿，缺一不可** ——
+        # ① 最新**正式**线（npm `latest` 与 `next` 都指向 0.2.0-rc.2；官方桌面端与 dsh 同版本号，
+        #    也在这一条线上）；② 最新**预览**线（npm `alpha` 指向 0.2.1-alpha.1）。
+        #
+        # ★ 为什么预览线必须有自己的腿 —— 本仓栽过一次，而且**看着覆盖了、其实没有**：
+        #   `>=0.2.0-0 <0.3.0-0` 读起来覆盖整个 0.2.x，但按 semver 的预发布门，一个预发布版本
+        #   只有在**某个比较符点名了同 tuple** 时才被放行，而那个比较符的 tuple 是 0.2.0 ⇒
+        #   `0.2.1-alpha.1` 被拒。所以"声明看着宽"不等于"预览线被覆盖"，更不等于"跑过"。
+        #   两条都进矩阵，才有资格说"同时支持最新正式版与最新预览版"。
+        #
+        # 上一个正式版（0.1.7-rc.2）仍在 `engines.dsh` / peer 范围内，现役安装大多在它上面，
+        # 单独占一条腿 —— 别让"声明支持却没测过"重演。更早的线（0.1.5-rc.3、0.1.6-alpha.*）
+        # 与它们共用同一套机制，peer 范围仍然接纳，但**不再各占一条 CI 腿**：跟着每条历史线跑，
+        # 成本线性增长而收益递减。
+        #
+        # 注意 0.2.0 起 dsh 把兼容性从"告警"升级成**安装闸门**：范围不覆盖运行时就装不进去，
+        # 所以声明范围本身就是"支持"这个动作（见 AGENTS.md 第 10/18 条）。
+        dsh: ['0.2.0-rc.2', '0.2.1-alpha.1']
+        include:
+          # Windows 是最容易出差异的平台，而它长期没进过 CI：一次外部 Windows 实测因此
+          # 发现了三处只在 Windows 显现的缺陷（install.sh 的 MSYS 路径、并发 rename 的
+          # EPERM、平台表达式行的求值方向导致 4 条断言假失败）。只在 node 24 上跑，控时长。
+          - os: windows-latest
+            node-version: '24'
+            dsh: '0.2.0-rc.2'
+          # 稳定腿 = 上一个正式版。npm `latest` 已于 2026-09-29 移到 0.2.0-rc.2，但现役用户
+          # 大多还在 0.1.7-rc.2 上，而 peer 范围仍然接纳它 —— 别让"声明支持却没测过"重演。
+          - os: ubuntu-latest
+            node-version: '24'
+            dsh: '0.1.7-rc.2'
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      # 装 DSH 本身。**出厂 preset 夹具不再由这里补**。
+      #
+      # 为什么删掉了"装一份 0.1.6 的旧包当夹具"这一步（它自 1.9.10 起让 0.1.7 的三条腿全红）：
+      #
+      #   在装了 @deepseek-ai/dsh@0.1.7-rc.2 的树上再 `npm i @deepseek-ai/dsh-agent-presets@0.1.6-alpha.2`
+      #   会 **ERESOLVE 失败**（0.1.6 夹具与 0.1.7 的 peer 树冲突），而 GitHub 的 `bash -e` 直接判这一步
+      #   失败 —— 于是 0.1.7-rc.2 的三条腿（ubuntu node20 / node24 / windows）自 1.9.10 起一直是红的，
+      #   **恰好是插件宣称"已适配"、官方桌面端内置的那条线**。即便加上 --legacy-peer-deps 让安装成功，
+      #   它还会把刚装好的 dsh 从树里剪掉。红着的腿不跑测试，所以设置页在那条线上整体不可用（P0）
+      #   没有任何 CI 信号。
+      #
+      #   现在走**与产品同一条派生代码**：`test/run.mjs` 的第四解析顺位从
+      #   `@deepseek-ai/dsh-web-app/presets/<mode>.patch.yml` 里抽出声明，落到仓库根的
+      #   `node_modules/@deepseek-ai/dsh-agent-presets/presets`（**必须在仓库根**：`unresolvableRows()`
+      #   是从 presets 目录往上推三层找 `node_modules/@deepseek-ai` 的，放临时目录会让判定静默变松）。
+      #   旧线（≤0.1.6，包括我们还测的 0.1.5-rc.3）本来就自带复数包，这条派生不会触发。
+      - name: 安装 DSH（夹具由 test/run.mjs 从已安装的声明派生）
+        shell: bash
+        run: |
+          # ★ 装之前把仓库根的 package.json 挪开，装完立刻放回（trap 兜底）。
+          #   实测（2026-09-30，node 20 + npm 10.8.2）：根清单是**插件清单**，它把
+          #   @deepseek-ai/dsh 声明为 optional peer；在这个组合下
+          #   `npm install --no-save @deepseek-ai/dsh@<线>` 会**成功退出（exit 0）却什么都没装**
+          #   （added 11 packages，npm ls 显示 (empty)，@deepseek-ai/ 下只剩一个平台可选包），
+          #   于是紧随其后的 require 才报 MODULE_NOT_FOUND。node 24 / npm 11 的腿没有这个问题。
+          #   换 --legacy-peer-deps 更糟：npm 判定 "up to date"，一个包都不装。
+          #   挪开清单后同一条命令 539 个包、dsh 正常落地；安装位置仍是仓库根的 node_modules，
+          #   测试的解析路径一字未变。
+          restore_manifest() { if [ -f package.json.plugin ]; then mv -f package.json.plugin package.json; fi }
+          trap restore_manifest EXIT
+          mv package.json package.json.plugin
+          npm install --no-save --no-audit --no-fund "@deepseek-ai/dsh@${{ matrix.dsh }}"
+          restore_manifest
+          node -e "console.log('dsh 已安装:', require('./node_modules/@deepseek-ai/dsh/package.json').version)"
+          FIXTURE="node_modules/@deepseek-ai/dsh-agent-presets/presets"
+          if [ -d "$FIXTURE" ]; then
+            echo "本线自带 $FIXTURE（旧线），直接用作夹具"
+          else
+            echo "本线没有复数 presets 包（0.1.7+）—— 夹具由 test/run.mjs 从 dsh-web-app 的声明派生"
+          fi
+
+      # `dsh plugin` 会去 PATH 上找 pnpm 来管理 profile 的插件，找不到就**直接失败、没有回退**。
+      # 本机的开发环境一直有 pnpm，所以这个前提第一次上 CI 才发现没被写下来 ——
+      # 姊妹仓（dsh-zcode-farm）的第 6 道守卫首次上 CI 时踩过同一脚，这里照它的做法补上。
+      # 2026-10-01 实测：缺 pnpm 时 ubuntu 报 `pnpm was not found`（exit 127）、
+      # windows 报 `'pnpm' is not recognized`（exit 1）—— 措辞不同，守卫必须都认得出是环境问题。
+      - name: 装 pnpm（`dsh plugin` 需要它在 PATH 上）
+        run: npm install -g --no-audit --no-fund pnpm@12
+
+      - name: 语法检查
+        shell: bash
+        run: |
+          for f in *.mjs client.js preset/*.mjs test/*.mjs tools/*.mjs; do
+            node --check "$f"
+          done
+
+      # 两个套件：组成文件编译器 63 项 + 词典 65 项。
+      # run.mjs 自己解析出厂 preset 目录，解析不到会以退出码 2 明确报错。
+      - name: 测试
+        run: node test/run.mjs
+
+      # ★★ 对抗性探针 —— 79 条断言，写的是**期望行为**，所以在有缺陷的代码上会红。
+      #
+      # 为什么必须进 CI：这套探针 2026-09-21 写过一轮（79 条里 20 条失败），修完之后
+      # **没有接进 CI**，于是 1.10.0 把 `editor/` 并入仓库根时它们全部指向了不存在的路径 ——
+      # 从那天起整套探针**静默跑不起来**，而没人知道，因为没人跑。
+      # 2026-10-01 修好路径后重跑，仍然红着 14 条：**那是 14 个真缺陷，全都没有 issue**。
+      # 「跑不起来」和「全过」在没人执行时是同一个状态 —— 这就是它们必须在这里的原因。
+      #
+      # 夹具：探针要一份出厂基础模式（`readBaseComposition` 用它做手术）。
+      # 显式指向 test/run.mjs 已经派生好的那份，而不是依赖 $HOME —— CI 里没有 $HOME/.dsh。
+      - name: 对抗性探针（79 条断言）
+        shell: bash
+        run: |
+          FIXTURE="$PWD/node_modules/@deepseek-ai/dsh-agent-presets/presets"
+          if [ ! -d "$FIXTURE" ]; then
+            echo "::error::夹具目录不存在：$FIXTURE（应由上一步 test/run.mjs 派生）。探针没有出厂组成可做手术。"
+            exit 1
+          fi
+          export DSH_SHIPPED_PRESETS_DIR="$FIXTURE"
+          bash tools/probes/run.sh
+
+      # Git Bash 也在 Windows 上跑这一段：脚本里任何"绝对路径进 node -e"的写法会在这里
+      # 以外的方式暴露（真正抓住它的是 test/meta.test.mjs 的静态守卫）。
+      - name: install.sh 自身可解析（bash -n）
+        shell: bash
+        run: |
+          bash -n install.sh
+          bash -n uninstall.sh
+
+      # 包版本必须等于 CI 钉住并测试的 dsh 版本（允许 .revN 修订后缀）。
+      # 只改一处会让 CI 在旧运行时上通过，而发布的包声称适配了没测过的版本。
+      # 每个矩阵项都断言：**它自己装的那条 dsh 线**落在声明的兼容范围内。
+      - name: 版本一致性
+        run: node tools/verify-version-consistency.mjs --dsh ${{ matrix.dsh }}
+
+      # README.md / README.zh.md（以及 CONTRIBUTING 那一对）权威相同：
+      # 改了一侧忘了另一侧，这里直接失败，而不是等有人切语言才发现。
+      - name: 双语配对一致性
+        run: node tools/verify-translation-pairing.mjs
+
+      # 44f7fdb 缩短中文词典后，browser-verify 仍点旧按钮，闸门在第 33 项抛掉。
+      # 词条必须来自 locales.mjs；这一步在不启动浏览器的情况下挡住下一次漂移。
+      - name: 渲染闸门词条跟词典走
+        run: node tools/verify-browser-literals.mjs
+
+      # 文档里的数字也是声明，所以也当检查跑：套件数/检查数/dsh 范围/支持表里的版本，
+      # 全部与实际运行结果对齐（外部审阅一次就找出三处漂移，而测试看不到文档）。
+      - name: 文档数字与实际一致
+        run: node tools/verify-doc-numbers.mjs
+
+      # ★ 工作流文件本身也要校验 —— 它的错**只在打 tag 时才会暴露**。
+      #
+      # 实测（2026-10-01）：改 `.dshpreset` 的 manifest 时，新插的几行写成 4 格缩进，而同一个
+      # `run: |` 里的内容用的是 10 格。块标量遇到比块首行更浅的缩进就结束，后面的行被当成 YAML
+      # 解析 ⇒ release.yml 语法错。本地跑测试、跑渲染闸门**都看不见**，只有下一次发布才发现。
+      #
+      # 这一条必须用真解析器：这个仓库是零依赖的（`agent.cordis.yml` 走手写解析器），而
+      # "块被提前结束"与"块正常结束"在字符串层面长得一样 —— 手搓的启发式判不出来（试过，抓不到）。
+      # 顺带校验 heredoc 里的 Python 能编译：YAML 合法不等于里面的代码合法。
+      - name: 工作流 YAML 与 heredoc（python3 + pyyaml）
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 tools/verify-workflows.py
+
+      # ★★ 真启动 —— 唯一会**真的 apply 插件**的一道守卫。
+      #
+      # 为什么必须有它：`--dump-config` 只合成配置、不 apply 插件，装配行 `name` 解析失败时
+      # 既不报错也不留痕（行照样列在 dump 里、exit 0、stderr 空）。本仓在这上面栽过：
+      # 0.1.7 换了 preset 机制，设置页的能力闸门把整页关掉 —— 那是插件的**唯一界面**，
+      # 而当时六道守卫全绿，因为**没有一道真正运行过这个插件**。
+      #
+      # 断言四条：A 装得上（0.2.0 起这也是 peer 范围的**安装闸门**，用户就是这么撞上的）、
+      # B `cordis.patch.yml` 的行 name == 包名、C 端口应答**并且按住 2 秒仍在应答**、
+      # D stderr 里没有致命模式（白名单式，允许本插件刻意的降级告警）。
+      # 端口 32010 是本插件的实验台号段（见 docs/20-conventions/06 的端口表）。
+      - name: 真启动（装得上 ≠ 起得来）
+        if: matrix.node-version != '20'
+        run: node tools/boot-check.mjs --port 32010
+
+      # ★ 并集组成真能挂载（boot-check 覆盖不到的那一格）。
+      #
+      # 第五个基础模式 `all` 是四个出厂组成的并集，而其中两行是**同一件工具的两套实现**
+      # （minimal 的 persistent-shell 与 standard 的 tool-bash / tool-pwsh，都注册名为 bash）。
+      # 单独看任何一个模式都不冲突，并起来就让宿主把整个预设判 broken ——
+      # 而 **broken 的预设被从所有选择器里静默丢掉，设置页照常全绿**。
+      # 这个缺陷对 800+ 项测试**完全隐形**：单测断言的是合成器返回了什么，
+      # 而失败发生在**宿主拿这个结果去挂载**的时候。`renderComposition('all')` 可以返回
+      # 语法完全合法的 YAML，同时被宿主拒绝。
+      #
+      # 所以这一步：真写出并集组成 → 真起一个实例 → **问那个实例自己**
+      # （GET /api/custom-mode/state?id=custom，断言 broken=null / unresolvable=[] /
+      # warnings=[] / mode=all / 41 行都端出来了）。日志安静从来不是信号，宿主的 roster 才是。
+      #
+      # 断言 B 是**超集**而不是"更宽"：并集按定义不含"只属于并集"的行，
+      # 第一版断言写成 `union > 每个 base` 而在**正确的**并集上就红了（41 vs 34）——
+      # 与被保护对象定义矛盾的断言比没有断言更糟，它训练人去"修"本来能跑的代码。
+      #
+      # 端口 32011 是本插件号段里紧挨 boot-check 的下一个（32010 被上一步占着）。
+      - name: 并集组成真能挂载（问实例自己）
+        if: matrix.node-version != '20'
+        run: node tools/union-mount-check.mjs --port 32011
+
+      # node 20 腿跳过真启动，**并且说出来** —— 有声明地跳过，不是静默缺口。
+      - name: 跳过说明（node 20 不跑真启动守卫）
+        if: matrix.node-version == '20'
+        shell: bash
+        run: |
+          echo "::warning::node 20 腿跳过了真启动守卫与并集挂载守卫：该运行时下宿主装不完整（依赖树里有包要求 node >= 22.19），两个守卫都会以退出码 2 判为环境问题。测试套件与其余守卫在这一腿上照常跑。"
+
+      # 发布包最容易踩的坑不是"多打了文件"，而是**少打了**：dsh.bundle.patch 指向的补丁、
+      # 或浏览器半的 client.js 一旦被 files 白名单漏掉，npm 上的包装了也没用，
+      # 而且要等到有人装完才发现。这里对着真实的 packlist 断言。
+      - name: npm 打包自检（发布包里不能少文件）
+        shell: bash
+        run: |
+          npm pack --dry-run --json > "$RUNNER_TEMP/pack.json"
+          node -e '
+            const fs = require("fs");
+            const files = JSON.parse(fs.readFileSync(process.argv[1], "utf8"))[0].files.map((f) => f.path);
+            const need = ["index.mjs", "client.js", "composition.mjs", "meta.mjs", "paths.mjs", "cordis.patch.yml", "package.json"];
+            const missing = need.filter((name) => !files.includes(name));
+            const stray = files.filter((path) => /^(test|tools|docs)\//.test(path));
+            console.log("打包内容:", files.join(", "));
+            if (missing.length > 0) {
+              console.error("打包缺文件:", JSON.stringify(missing));
+              process.exit(1);
+            }
+            if (stray.length > 0) {
+              console.error("打包混入了非运行时文件:", JSON.stringify(stray));
+              process.exit(1);
+            }
+          ' "$RUNNER_TEMP/pack.json"

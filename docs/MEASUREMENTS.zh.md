@@ -1,0 +1,1938 @@
+# 实测记录
+
+[English](MEASUREMENTS.md) | 中文
+
+> 文件名用英文（`MEASUREMENTS.md`）是为了与 `docs/` 下其它文档一致；正文为中文。
+
+这份文档记录**在真机上跑出来的结果**，不是设计说明。每条都给出命令与当时的输出，便于复跑核对。
+环境：dsh `0.1.6-alpha.1`、Node 24.21.0、WSL2（mirrored 网络模式）、全新 `DSH_HOME`
+（不碰开发机上正在用的那个实例）。
+
+复跑方式见每节的命令；`$REPO` 指本仓库，`$H` 指一个独立的 `DSH_HOME`。
+
+---
+
+## 0. 端到端：改提示词 → **下一步就生效**（真实会话，两个来回）
+
+整个项目就立在这一句话上，而它此前只有"读取函数会被重新求值"的单元测试，没有"agent loop
+真的每一步都调它"的端到端证据。这一节补的就是它。
+
+**为什么要用「标记」而不是让它复述系统提示词**：直接要求模型复述系统提示词会被拒绝
+（实测：`我不能复述系统提示词的内容` —— 这是合理的安全行为，不是 bug）。所以改成在提示词里
+植入一条**格式规则**，看模型的实际行为是否跟着文件走：
+
+```
+【格式规则，每次回答都必须遵守】
+你的每一条回答，第一行必须正好是下面这一串字符，前后不留任何其他字符：
+
+MARK-ONE
+```
+
+**做法**：在真实运行的 web 实例里开一个会话，问一句 → 回答后**不重启、不刷新、不新建会话**，
+只把 `prompt.md` 里的 `MARK-ONE` 改成 `MARK-TWO`，再在**同一个会话**里问第二句。
+
+**实测结果**（同一个浏览器页面，同一个 session）：
+
+```
+第 1 轮：1+1 等于几？   →  MARK-ONE  2          （用量 8.1K tok）
+（把 prompt.md 改成 MARK-TWO）
+第 2 轮：2+2 等于几？   →  MARK-TWO  4          （用量 9.3K tok）
+```
+
+判定：
+
+```json
+{
+ "turn1_hasMarkOne": true,
+ "turn2_hasMarkTwo": true,
+ "turn2_stillOnlyMarkOne": false,
+ "finalPromptMarker": "MARK-TWO"
+}
+```
+
+也就是说：**编辑文件 → 下一步模型调用就用新文本**，成立；不需要重启，也不需要新建会话。
+（`prompt-reader.mjs` 的单元测试还证明了稳态下不会重复读盘：一个 `stat` 与尺寸比对。）
+
+两轮之间，界面里会出现一行「**系统提示词更新**」—— 那是 dsh 自己标的，说明它检测到系统提示词在会话中途变了。
+
+驱动脚本的思路见下：先用 CDP 把工作区选好、把问题打进 composer，再轮询页面文本直到标记出现。
+
+> **一条走不通的路，记下来省得再试**：`dsh --profile headless`（单轮 CLI）**不能**用来测这个。
+> 它明确拒绝运行带 agent preset 的会话，源码里写着：
+> `session "…" runs under agent preset "…", which the one-shot runner does not compose`。
+> 所以端到端只能用 web 实例跑。
+
+### 0.1 顺带验证：`agent-presets.default` 是运行时设置项，不是组合里的值
+
+```sh
+DSH_HOME=$H dsh --profile web --dump-config | grep -A3 'id: agent-presets'
+#   config:
+#     default: standard          ← 组合里写死的默认值
+```
+
+而 `$H/settings.yaml` 里的 `agent-presets: { default: custom }` 会在运行时覆盖它（首页的模式
+选择器随即显示「自定义模式」）。这两处不是同一个东西，排查"为什么默认模式没变"时容易搞混。
+
+---
+
+## 1. 全新环境安装：会用旧版 `install.sh` 踩到的那个坑
+
+```sh
+rm -rf "$H" && mkdir -p "$H"
+cp ~/.dsh/.credentials.yaml "$H/"          # 只要能启动就行，不涉及模型调用
+DSH_HOME="$H" ./install.sh                  # ← 修复前的版本
+```
+
+修复前输出：
+
+```
+==> 2/2 安装设置页插件 "dsh-custom-mode" 到 profile "web"
+    已移除解析不到的残留条目: ["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app"]
+    bundle 已登记: ["dsh-custom-mode"]
+安装完成。          ← 退出码 0，用户看不出任何异常
+```
+
+`$H/profiles/web/package.json` 的 bundles 从
+`["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app"]` 变成 `["dsh-custom-mode"]`，
+于是：
+
+```sh
+DSH_HOME="$H" dsh --profile web --dump-config
+# == dsh-custom-mode
+- id: custom-mode
+  name: dsh-custom-mode
+# ↑ 全文就这两行（正常是 158 行）
+
+DSH_HOME="$H" dsh web --port 3081 --no-open
+# dsh: warning: 1 entry did not activate
+# custom-mode (dsh-custom-mode): pending (waiting for services: webServer, agentPresets)
+# ↑ 服务永远等不到：没有界面、没有 agent
+```
+
+**触发条件**（实测两种顺序）：
+
+| 顺序 | 结果 |
+| --- | --- |
+| 全新 `DSH_HOME` → 直接 `./install.sh` | **踩中** |
+| 全新 `DSH_HOME` → 先启动过一次 `dsh web` → `./install.sh` | 不踩中：启动会把 harness 依赖填充进 `profiles/node_modules`，旧探测路径因此命中 |
+
+修复后（`==> 3/3 安装后自检`）：
+
+```
+    安装前 bundles: []
+    bundle 已登记: ["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app","dsh-custom-mode"]
+==> 3/3 安装后自检（组合 profile）
+    组合树 158 行，dsh-custom-mode 已就位
+```
+
+护栏本身也验证过：手工把 profile 改成 bug 后的状态再跑，它以非 0 退出：
+
+```
+    自检失败: 组合树只有 1 行，基础 bundle 疑似丢失（正常应有上百行）。
+    当前 bundles: ["dsh-custom-mode"]
+    自救: 把 profile 模板自带的 bundle 名（如 @deepseek-ai/dsh-base、
+          @deepseek-ai/dsh-web-app）加回上面这个列表，见 docs/TROUBLESHOOTING.md。
+```
+
+---
+
+## 2. 设置页路由的未授权读写（安全）
+
+修复前（实例跑在 3081）：
+
+```sh
+curl http://127.0.0.1:3081/custom-mode
+# → 200 {"ok":true,…,"prompt":"You are a coding agent powered by {{model}} model.…"}
+
+curl -X POST http://127.0.0.1:3081/custom-mode \
+     -H 'content-type: text/plain' \
+     --data '{"mode":"standard","overrides":{},"prompt":"PWNED-BY-UNAUTHENTICATED-POST\n"}'
+# → 200 {"ok":true,"mode":"standard","note":"已保存（基础模式：standard）…"}
+head -1 "$H/.agent-presets/custom/prompt.md"
+# PWNED-BY-UNAUTHENTICATED-POST          ← 文件真的被改了
+
+curl -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3081/
+# 401
+curl -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3081/api/settings
+# 401
+```
+
+修复后：
+
+| 请求 | 结果 |
+| --- | --- |
+| 未授权 GET | `401 unauthorized` |
+| 未授权 POST（`text/plain`） | `401`，文件未被改写 |
+| POST + `Origin: https://evil.example` + `Sec-Fetch-Site: cross-site` | `403 forbidden` |
+| 带合法 `dsh-auth-*` cookie（浏览器会话） | `200`，功能照旧 |
+
+复跑：
+
+```sh
+# 未授权
+curl -s -o /dev/null -w 'GET  %{http_code}\n' "http://127.0.0.1:3081/custom-mode"
+curl -s -o /dev/null -w 'POST %{http_code}\n' -X POST "http://127.0.0.1:3081/custom-mode" \
+  -H 'content-type: text/plain' --data '{"mode":"standard","overrides":{},"prompt":"x"}'
+# 有会话（token 从 dsh web 的日志里取）
+curl -s -c /tmp/cj -o /dev/null "http://127.0.0.1:3081/?token=$TOKEN"
+curl -s -b /tmp/cj -o /dev/null -w 'AUTH %{http_code}\n' "http://127.0.0.1:3081/custom-mode"
+```
+
+---
+
+## 3. 功能链路：拨开关 → 保存 → 磁盘上的实际结果
+
+在设置页把「网页检索与抓取」拨掉并点保存，页面状态栏返回：
+
+```
+已保存（基础模式：standard）。新建会话即生效，当前会话保持原配置。
+```
+
+磁盘上（`$H/.agent-presets/custom/agent.cordis.yml`）：
+
+```yaml
+# 本文件由「自定义模式」设置页生成，请勿手工编辑——下次保存会覆盖。
+# 基础模式: standard
+# 生成时间: 2026-09-17T10:03:12.800Z
+…
+- id: tool-web                    # ← 被显式关闭的行
+  name: '@deepseek-ai/dsh-tool-web'
+  disabled: true
+…
+- id: tool-bash                   # ← 没碰过的行，平台条件逐字节保留
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled: !!js process.platform === 'win32'
+```
+
+两件事同时得到证明：显式开关生效；**未触碰的行保持出厂状态**（这是这个项目正确性的核心，
+也是 `composition.test.mjs` 那 63 项在防的东西）。
+
+页面另一处可以立刻看出平台表达式确实在宿主端求值：在 Linux 上，`Shell（pwsh）` 显示
+「已停用 / 跟随平台」，而 `Shell（bash）` 是「已启用 / 跟随平台」——两者在 YAML 里都带
+`!!js` 条件。
+
+---
+
+## 4. 热更新契约：改文件 → 下一次求值就是新文本
+
+真会话里的端到端演示需要模型调用；不依赖模型的等价证据是直接驱动 `prompt-reader.mjs`：
+按注册表的方式取出 persona section 的 `text` provider 并调用它。
+
+```sh
+node test/prompt-reader.test.mjs
+```
+
+```
+PASS  prefix 的 text 是函数（每步重新求值）
+PASS  改文件后下一次求值读到新文本（无需重启）
+PASS  未变化时不重新读盘（删除后仍给出缓存文本）
+PASS  被清空后仍给出上一版内容
+PASS  complete: true 时不再注册 suffix
+结果: 15 通过, 0 失败
+```
+
+---
+
+## 5. 双语与深浅色
+
+不是"看代码觉得应该没问题"，而是通过**界面自己的控件**切换后截图核对：
+
+| 动作 | 观察到的结果 |
+| --- | --- |
+| 语言 → English | 导航项自动变成 `Custom mode`；小节标题变成 `Mode name` / `Base mode` / `Plugin switches` / `System prompt` |
+| 外观 → 深色 | 整页跟随（含卡片、徽标、输入框），无硬编码色值 |
+
+这两条现在不再各配一张图（重复画面不值得让读者多下载几百 KB）：切换是**真的做了**，
+断言与观察值写在 `tools/screenshots/observed.json` 里，拍摄脚本见 `tools/screenshots/`。
+
+---
+
+## 6. 测试与 CI
+
+```sh
+node test/run.mjs
+```
+
+```
+出厂 preset 目录: …/dsh-agent-presets/presets
+（来源：$DSH_HOME/profiles/node_modules）
+结果: 63 通过, 0 失败      ← 组成文件编译器
+结果: 15 通过, 0 失败      ← 热更新契约
+结果: 65 通过, 0 失败      ← 词典（含 client.js 手抄副本的漂移检查）
+7 个套件全部通过
+```
+
+解析链在两种布局下都验证过：
+
+| 布局 | 命中的来源 |
+| --- | --- |
+| 本机装了 dsh | `$DSH_HOME/profiles/node_modules` |
+| 干净目录里 `npm install @deepseek-ai/dsh@0.1.6-alpha.1`（CI 的做法） | 从本文件做 Node 解析 |
+
+CI 用 npm 上那份 dsh 自带的 presets，与本机逐字节相同（`diff -rq` 无差异），所以 CI 的结论是
+真结论，而不是拿自造 fixture 跑出来的。
+
+---
+
+## 7. 装到非 web profile：哪些能用、哪些不能（实测）
+
+`install.sh --help` 与两份 README 都写了 `--profile tui`，但**实测**要分清两个层次：
+
+| profile | 组合里有没有 `agent-presets` | 组合里有没有 `webServer` | 结果 |
+| --- | --- | --- | --- |
+| `web` | 有 | 有 | 模式可选 + 设置页可用（全功能） |
+| `tui` | **没有** | **没有** | 模式**无法被选中**；设置页也不存在 |
+| `headless` | 没有（且即使补上也会被拒绝，见 §0） | 没有 | 同上 |
+
+`agent-presets` 只在 web 组合里出现（`dsh --profile web --dump-config | grep agent-presets` 有输出，
+tui/headless 都是 0 行），而「自定义模式」这个 preset 正是由它挂载的——**所以在 tui 里它不是"设置页
+看不到"，而是这个模式根本不存在**。
+
+修复前，每次启动 tui 都会打印这一行（与 §1 那个"装完 dsh 变砖"的报错一模一样，纯误导）：
+
+```
+dsh: warning: 1 entry did not activate
+custom-mode (dsh-custom-mode): pending (waiting for services: webServer, agentPresets)
+```
+
+修复后不再 pending（插件改成作用域内等待服务），`install.sh` 也会**按 profile 分别说明**——
+这里刻意不写成"模式本身仍可用"，因为在 tui 上那句话不成立：
+
+```
+    注意: profile "tui" 里这个插件只有一部分能生效。
+          · 组合里没有 agent-presets：**「自定义模式」无法被选中**，
+            preset 文件被复制过去了，但没有任何东西会挂载它
+          · custom_prompt 工具可用（会话里直接说「把系统提示词改成……」）
+          · 没有设置页：组合里没有 web 服务器
+          要用完整功能（模式可选 + 图形化设置页），请装进 web profile：
+            ./install.sh --profile web
+```
+
+web profile 上同一段自检不打印任何提示（实测出现次数 0），收尾说明也照常给出
+"新会话选「自定义模式」"。
+
+---
+
+## 8. 卸载往返：`uninstall.sh` 曾留下一个软链
+
+```sh
+DSH_HOME=$H ./install.sh >/dev/null          # 装上
+DSH_HOME=$H ./uninstall.sh                   # 卸掉
+ls "$H/profiles/web/node_modules" | grep custom
+# 修复前：dsh-custom-mode      ← 仍在（指向仓库的软链）
+# 修复后：（无输出）
+```
+
+`package.json` 的 `dependencies` 与 `dsh.profile.bundles` 当时都已经清干净了，只有 pnpm 留下的
+软链还在（pnpm 12.4.2 上复现）。它不影响 dsh 装配（装配只看 bundles），但 uninstall 就该不留
+痕迹——尤其是随后删掉仓库时它会变成断链。现在只删这一个包名。
+
+卸载后的完整状态（实测）：
+
+```
+bundles:      ["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app"]   ← 回到模板原样
+dependencies: undefined                                              ← 清空
+preset 目录:  保留（提示词也保留，符合默认行为）
+组合树:       157 行（= 装上时的 158 行减去本插件那一行）
+```
+
+另外验证了二次安装的幂等性：装上 → 手工改 `prompt.md` → 再装一次，脚本保留用户提示词，
+只更新模式文件（`检测到已存在的 prompt.md，保留它（只更新模式文件）`）。
+
+---
+
+## 9. 市场安装：全新 `DSH_HOME` 上的播种
+
+市场的安装是一条命令，所以这个包必须自己就够用。在一个全新 `DSH_HOME`（只复制了凭据）上装打包好的
+tarball 再启动，实测：
+
+```
+$ DSH_HOME=$H dsh plugin --profile web add dsh-custom-mode-0.1.6-alpha.1.rev1.tgz
++ dsh-custom-mode file:/tmp/dsh-custom-mode-0.1.6-alpha.1.rev1.tgz
+
+$ ls $H/.agent-presets/custom        # 启动前：没有，播种发生在激活时
+  （不存在）
+
+$ DSH_HOME=$H dsh web --port 3082 --no-open
+custom-mode: 已播种 preset 到 …/.agent-presets/custom（新建 5 个文件: agent.cordis.yml, preset.yml,
+prompt.md, prompt-reader.mjs, prompt-tool.mjs）
+dsh web: http://127.0.0.1:3082/?token=…
+```
+
+之后新建会话的模式选择器里就能选到它（用拍摄脚本同一套 CDP 驱动读的列表：`Standard mode / PTC mode /
+Minimal mode / Creator mode / 自定义模式`），设置页也能读到完整状态：
+
+```
+GET /custom-mode（带会话 cookie） → 200 {"ok":true,"mode":"standard",…19 行…}
+GET /custom-mode（不带 cookie）   → 401
+```
+
+验收其余各项：
+
+| 项目 | 结果 |
+| --- | --- |
+| 第二次启动 | 完全没有 `已播种` 日志 —— preset 完整时一个字都不写 |
+| 启动前已存在的 `prompt.md` | 事后逐字节相同（`md5` 未变）；另外四个文件被补齐 |
+| `$DSH_HOME/.agent-presets` 只读 | dsh 照常启动；日志 `preset 播种未完成 —— 无法创建 … EACCES`，设置页返回 `{"ok":false,"error":"找不到组成文件：…"}` |
+| 走设置页自己的路由改名 + 切基础模式 | `preset.yml` → `name: "My Renamed Mode"`，组成文件表头 `# 基础模式: minimal`，行数 19 → 3，提示词被重写 |
+| 在播种出来的实例上跑完整 UI 流程 | 拍摄脚本读到状态、拨掉一行、保存成功（`已保存（基础模式：standard）…`）、切换语言与主题 |
+
+## 10. 面向 dsh `0.1.6-alpha.2` 的升级核对 —— 耦合点逐条静态验证
+
+项目的版本策略要求：官方发新版后，先照耦合点清单核对，再动版本号。这一节就是 `0.1.6-alpha.2` 的
+那次核对，而且**不需要浏览器**——契约都是类型声明，拉下包就能回答。
+
+**方法**：下载 `dsh-agent-presets`、`dsh-system-prompt`、`dsh-client-locale`、
+`dsh-client-connection`、`dsh-tools`、`dsh-host-webserver`、`dsh-client-ui-settings`、
+`dsh-client-ui-slots` 的 `0.1.6-alpha.2` 包；把本项目依赖的声明从新版与本机已装的
+`0.1.6-alpha.1` 里各抓一遍；逐条比对。然后把整套测试**对着两个版本的出厂 preset 各跑一次**。
+
+### 所有耦合点均未变化
+
+| 耦合点 | 声明所在包 | 结果 |
+| --- | --- | --- |
+| `agentPresets.list()` 返回形状（`trust`、`path`） | `dsh-agent-presets` | 未变（11 处匹配） |
+| `systemPrompt.section({ text: fn })` —— text 作为 provider | `dsh-system-prompt` | 未变 |
+| `PromptSection.complete` | `dsh-system-prompt` | 未变 |
+| `locale.register` / `locale.bind` | `dsh-client-locale` | 未变 |
+| `connection.requestRejection`（失败关闭 503） | `dsh-client-connection` | 未变 |
+| `tools.register(definition: ToolDefinition)` | `dsh-tools` | 未变 |
+| `WebRoute { kind, path, handler }` | `dsh-host-webserver` | 未变 |
+| `settings.section` 插槽：`kind: list`、`scope: root`、owner props | `dsh-client-ui-settings` | 未变 |
+| `locale:` 注册选项（提供绑定的 `t`） | `dsh-client-ui-slots` | 仍然存在——原文："present exactly on entries whose registration declares `locale:`" |
+
+### 确实变了的部分：每个模式多一行
+
+`standard`、`ptc`、`cordis` **各多且只多一行**——`tool-plugin-manager`
+（`@deepseek-ai/dsh-plugin-manager/tools`）；`minimal` 未变。**不需要改任何代码**：编译器运行时
+读出厂组成文件，重新生成时会自动带上。它只是没有显示标签，现已补齐中英两份；并且
+`composition.test.mjs` 现在断言"出厂每一行都能查到 `ROW_META` 条目"，所以下次官方新增行会让
+CI 变红，而不是在界面上静默显示成裸 id。
+
+### 测试结果
+
+```
+DSH_SHIPPED_PRESETS_DIR=<0.1.6-alpha.1 的 preset> node test/run.mjs   → 8 个套件全部通过
+DSH_SHIPPED_PRESETS_DIR=<0.1.6-alpha.2 的 preset> node test/run.mjs   → 8 个套件全部通过
+```
+
+### 附带发现：以 root 运行时，`chmod` 无法伪造不可写目录
+
+`test/seed.test.mjs` 原先对父目录用 `chmod 0o500` 来触发播种的失败路径。实测：**root 会绕过权限位**，
+于是播种照样成功，三条断言翻红。它们**在 CI（非 root 的运行器）上绿，在以 root 跑套件的人那里红**
+——一个"结果取决于谁在跑"的测试。改用普通文件阻断路径后，任何用户下都返回 `ENOTDIR`，这些断言
+在任何地方含义一致。
+
+---
+
+## 11. 多助手：一个设置页新增/删除/切换 N 个模式（真实实例）
+
+环境同 §9：全新的 `DSH_HOME=/tmp/dsh-dev`，web profile，独立端口 3081 —— 不碰开发机上正在用的实例。
+
+### 11.1 测试套件
+
+```
+$ node test/run.mjs
+出厂 preset 目录: /usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-agent-presets/presets
+（来源：$DSH_HOME/profiles/node_modules）
+…
+结果: 64 通过, 0 失败      composition.test.mjs
+结果: 26 通过, 0 失败      composition-edge.test.mjs
+结果: 15 通过, 0 失败      prompt-reader.test.mjs
+结果: 37 通过, 0 失败      prompt-tool.test.mjs
+结果: 45 通过, 0 失败      meta.test.mjs
+结果: 56 通过, 0 失败      assistants.test.mjs   ← 本次新增
+结果: 94 通过, 0 失败      editor-route.test.mjs ← 由 1 条路由扩到 5 个端点
+结果: 31 通过, 0 失败      seed.test.mjs
+结果: 66 通过, 0 失败      locales.test.mjs
+结果: 19 通过, 0 失败      client-bundle.test.mjs ← 本次新增（浏览器半的注册契约）
+结果: 16 通过, 0 失败      manifests.test.mjs
+11 个套件全部通过（presets 来源：$DSH_HOME/profiles/node_modules）   ← 合计 469 项检查
+```
+
+### 11.2 安装与启动
+
+```
+$ DSH_HOME=/tmp/dsh-dev ./install.sh
+    组合树 164 行，dsh-custom-mode 已就位
+$ DSH_HOME=/tmp/dsh-dev dsh web --port 3081 --no-open --host 127.0.0.1
+dsh web: http://127.0.0.1:3081/?token=…
+```
+
+用 token 换到浏览器会话 cookie（`GET /?token=…` → `303` + `set-cookie: dsh-auth-…`），下面全部带这份 cookie。
+
+### 11.3 栅栏与列表
+
+```
+$ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:3081/custom-mode
+401                                          ← 未授权（栅栏仍然第一优先）
+
+$ curl -s -b "$JAR" http://127.0.0.1:3081/custom-mode
+{"ok":true,"assistants":[{"id":"custom","name":"自定义模式","description":"完整编码能力…"}],
+ "root":"/tmp/dsh-dev/.agent-presets"}
+```
+
+### 11.4 新增两个助手（一个中文名、一个英文名）
+
+```
+$ curl -s -b "$JAR" -H 'content-type: application/json' \
+    -d '{"name":"写作助手","description":"负责写文档与博客"}' http://127.0.0.1:3081/custom-mode/create
+{"ok":true,"id":"custom-2","name":"写作助手",…}      ← 中文 slug 为空 → custom-2
+
+$ curl -s -b "$JAR" -H 'content-type: application/json' \
+    -d '{"name":"Writer"}' http://127.0.0.1:3081/custom-mode/create
+{"ok":true,"id":"writer","name":"Writer",…}          ← 英文名直接当目录名
+
+$ ls -1 /tmp/dsh-dev/.agent-presets/
+custom
+custom-2
+writer
+```
+
+新目录里是 5 个文件的完整模板，其中 `agent.cordis.yml` 是按 standard 重新生成的：
+
+```
+$ head -3 /tmp/dsh-dev/.agent-presets/custom-2/agent.cordis.yml
+# 本文件由「自定义模式」设置页生成，请勿手工编辑——下次保存会覆盖。
+# 助手: 写作助手 (custom-2)
+# 基础模式: minimal
+$ grep -n modeName /tmp/dsh-dev/.agent-presets/custom-2/agent.cordis.yml
+77:    modeName: "写作助手"
+```
+
+### 11.5 每份提示词各自独立（这是「多个 Agent 各自可自定义」的判据）
+
+```
+$ curl -s -b "$JAR" -H 'content-type: application/json' \
+    -d '{"id":"custom-2","mode":"minimal","overrides":{"tool-fs":false},
+         "prompt":"你是写作助手，负责把要点写成清晰的文档。\n\n工作目录：{{cwd}}\n",
+         "name":"写作助手","description":"负责写文档与博客"}' \
+    http://127.0.0.1:3081/custom-mode/state
+{"ok":true,"id":"custom-2","mode":"minimal","note":"已保存（写作助手，基础模式 minimal）。…"}
+
+$ head -c 30 /tmp/dsh-dev/.agent-presets/custom/prompt.md   → You are a coding agent pow
+$ head -c 30 /tmp/dsh-dev/.agent-presets/custom-2/prompt.md → 你是写作助手，负责把要点写成清
+$ head -c 30 /tmp/dsh-dev/.agent-presets/writer/prompt.md   → You are a coding agent pow
+```
+
+校验仍然守着写入路径（拒绝时文件不动）：
+
+```
+$ curl -s -b "$JAR" -H 'content-type: application/json' \
+    -d '{"id":"custom-2","mode":"minimal","prompt":"x {{foo}} y"}' …/custom-mode/state
+{"ok":false,"error":"保存被拒绝：{{foo}} 不是已注册的变量，渲染时会报错并让本模式每个请求都失败。可用：{{model}}、{{cwd}}、{{provider}}。"}
+```
+
+### 11.6 删除：出厂模式不可删，自己建的可以
+
+`remove` 走的是 `scope.agentPresets.remove(id)`，所以「删的确实是 roster 里的那一行」这件事本身就是
+「运行中的进程已经发现了新目录」的证明：
+
+```
+$ curl … -d '{"id":"standard"}' …/custom-mode/delete
+{"ok":false,"error":"找不到助手「standard」。设置页只管理本工具创建的模式…"}
+
+$ curl … -d '{"id":"writer"}' …/custom-mode/delete
+{"ok":true,"id":"writer","note":"已删除「writer」。正在使用它的会话不受影响；新建会话时不再出现。"}
+$ ls -1 /tmp/dsh-dev/.agent-presets/
+custom
+custom-2
+```
+
+方法与子路径（`GET` 不能建助手）：
+
+```
+$ curl -s -o /dev/null -w "%{http_code}\n" -b "$JAR" …/custom-mode/create   → 405
+$ curl -s -b "$JAR" …/custom-mode/nope
+{"ok":false,"error":"未知的子路径：/custom-mode/nope"}
+$ curl … --data-binary @4MB.json …/custom-mode/state                        → 500（请求体过大）
+```
+
+### 11.7 新助手真的会出现在模式选择器里
+
+选择器读的就是 discovery，所以直接问 discovery（跑在真实实例的 `DSH_HOME` 上）：
+
+```
+$ node /tmp/roster-check.mjs
+custom     user    自定义模式        mountable
+custom-2   user    写作助手         mountable      ← 没有 broken，说明组成文件可加载、每行都能解析
+standard   system  标准模式         mountable
+ptc        system  PTC 模式        mountable
+minimal    system  极简模式         mountable
+cordis     system  创造模式         mountable
+```
+
+浏览器半也确认是新的（页面加载的那份 bundle，与仓库文件逐字节一致，只多了 `sourceMappingURL`）：
+
+```
+$ curl -s -b "$JAR" '…/plugins/??dsh-custom-mode/client.js&rev=…' -o /tmp/served-client.js
+http=200 bytes=44361
+$ diff /tmp/served-client.js editor/client.js
+874,875d873
+< ;
+< //# sourceMappingURL=/plugins/??dsh-custom-mode/client.js.map&rev=…
+```
+
+**未验证的一项**：没有浏览器可用，所以 React 实际渲染出来的界面（助手列表、按钮布局）没有截图核对。
+其余链路（路由、磁盘、roster、bundle）都在真实实例上跑过。
+
+---
+
+## 12. 界面对齐壳的原子组件（种子表实测）+ 复制助手（真机）
+
+### 12.1 决定这层 UI 能不能成立的证据：种子表
+
+手写 bundle 只能 `require`。所以「用官方控件」的前提是壳把控件注册成了种子词。在
+`dsh-web-frontend/dist/assets/index-8VXBH-f-.js`（616 KB）里搜到的就是那张表：
+
+```
+$ python3 - <<'PY'   # 在 dist 里搜 dsh-client-ui-primitives 并打印上下文
+...untime":_c,"react-dom":bc,"react-dom/client":Ic,"@deepseek-ai/cordis":ec,
+"@deepseek-ai/dsh-client-store":Jc,"@deepseek-ai/dsh-client-ui-slots":ou,
+"@deepseek-ai/dsh-client-ui-primitives":Cy,"@deepseek-ai/dsh-client-ui-dockkit":Xw}}var ix=class{...
+```
+
+它和 `react` 同级，因此任何 bundle 都能 require，且**不需要** `dsh.client.external`
+（那个字段服务于启动清单里有独立记录的「图行」）。
+
+### 12.2 它在启动清单里的形态（容易被误判）
+
+```
+$ python3 … 解析 globalThis["__DSH_BOOT__"]
+keys: ['rev', 'entries', 'batches'];  entries: 59
+--- @deepseek-ai/dsh-client-ui-primitives      → (NOT A ROW)
+--- @deepseek-ai/dsh-client-ui-settings-general → {"id":"…settings-general","url":"/plugins/??…&rev=b97a6adea38cd90c-20","inject":[…]}
+--- dsh-custom-mode                             → {"id":"dsh-custom-mode","url":"/plugins/??dsh-custom-mode/client.js&rev=b97a6adea38cd90c-49","rev":"…-49"}
+declared by @deepseek-ai/dsh-client-ui-subagent in inject
+declared by @deepseek-ai/dsh-client-ui-jobs in inject
+```
+
+即：**它不是一条 entry**，只出现在两个官方 bundle 的 `inject` 里，而官方
+`settings-general` 运行时 require 它却没有声明 —— 与 12.1 的种子表结论一致。
+（只看 boot manifest 会得出「必须先声明依赖」的错误结论。）
+
+### 12.3 复制助手（真机，端口 3081）
+
+```
+$ curl … -d '{"id":"custom","mode":"minimal","overrides":{"tool-fs":false},
+              "prompt":"原始提示词 MARK-SOURCE\n","name":"原始助手","description":"被复制的那一个"}' …/custom-mode/state
+{"ok":true,…}
+
+$ curl … -d '{"name":"副本助手","from":"custom"}' …/custom-mode/create
+{"ok":true,"id":"custom-2","name":"副本助手",
+ "note":"已复制出「副本助手」：提示词、基础模式与插件开关都来自「custom」，之后各改各的，互不影响。"}
+
+$ curl … '…/custom-mode/state?id=custom-2'
+{"id":"custom-2","mode":"minimal","overrides":{},"prompt":"原始提示词 MARK-SOURCE\n",
+ "name":"副本助手","description":"被复制的那一个","promptPath":"/tmp/dsh-dev/.agent-presets/custom-2/prompt.md"}
+
+$ grep -c MARK-SOURCE /tmp/dsh-dev/.agent-presets/*/prompt.md
+/tmp/dsh-dev/.agent-presets/custom/prompt.md:1
+/tmp/dsh-dev/.agent-presets/custom-2/prompt.md:1
+```
+
+`overrides` 是 `{}` 而不是 `{"tool-fs":false}`：源自己也是 `{}` —— minimal 模式里没有 `tool-fs` 这一行，
+所以那个开关在写入时就被忽略了。复制体与源**逐字段一致**，这正是要断言的性质。
+
+### 12.4 缓存头与 rev（决定用户要不要清缓存）
+
+```
+$ curl -D - … '/plugins/??dsh-custom-mode/client.js&rev=b97a6adea38cd90c-49'
+HTTP/1.1 200 OK
+cache-control: public, max-age=31536000, immutable
+```
+
+immutable 看着危险，但 rev 是内容哈希：
+
+```
+dsh-client-modules/lib/index.js:
+  function artifactRevision(bundle, baseline) {
+    return framedHash("plugin-artifact", [bundle, Buffer.from(String(baseline.mtimeMs))]);
+  }
+  const rev = artifactRevision(readFileSync(record.meta.clientPath), baseline);
+```
+
+文件字节或 mtime 一变，rev 就变，URL 就变。**所以重启后普通刷新即可**。
+
+### 12.5 套件
+
+```
+结果: 104 通过, 0 失败      editor-route.test.mjs  ← 新增：路由常量防漂移、复制助手
+结果: 26 通过, 0 失败       client-bundle.test.mjs ← 新增：原子组件有/无两条路径
+11 个套件全部通过（presets 来源：$DSH_HOME/profiles/node_modules）   ← 合计 486 项检查
+```
+
+---
+
+## 13. `settings.section` 契约变化导致的整页键名 + 排序真机验证
+
+### 13.1 权威契约（不是推断）
+
+插槽声明随 `dsh-cordis-client-runner` 一起打包，含 `registerOptions` 与文档：
+
+```
+$ python3 - <<'PY'   # 在 dsh-cordis-client-runner/lib/client.js 里取 settings.section 的声明
+{
+  key: "settings.section", kind: "list", scope: "root",
+  registerOptions: [
+    { name: "id",    requirement: "required", type: "string" },
+    { name: "order", requirement: "optional", type: "number" },
+    { name: "label", requirement: "optional", type: "string | (() => string)" }
+  ],
+  ownerProps: […SettingsSectionOwnerProps…],
+  standardProps: ["useResource: UseResource", "useWorkspaces: …", …]
+}
+```
+
+**`locale:` 不在其中。** 旧写法依赖它把壳绑定好的 `t` 递进组件，于是正文全部回显键名。
+
+### 13.2 启动清单：本插件只装一次（排除「重复 apply」这一支）
+
+```
+$ 解析 globalThis["__DSH_BOOT__"]
+entries: 59
+dsh-custom-mode 出现次数: 1
+它的 manifest 行: [{"id":"dsh-custom-mode","url":"/plugins/??dsh-custom-mode/client.js&rev=e159d1f9c23eee42-49","rev":"e159d1f9c23eee42-49"}]
+ui-primitives 是不是一条 entry: False        ← 它是种子词，不是图行
+```
+
+所以「页面出现两次注册/两次 apply」在这一版不成立；配合上面的契约变化，正文键名的解释是充分的。
+
+### 13.3 修复后的服务端产物与词典内容
+
+```
+$ curl -s '…/plugins/??dsh-custom-mode/client.js&rev=e159d1f9c23eee42-49' -o /tmp/s3.js
+http=200 bytes=70019
+$ node -e "…统计内联词典…"
+served ZH 条数: 127
+served ZH 里有 nav 吗: true
+served ZH 里有 assistant.heading 吗: true
+```
+
+即：地板词典确实随包送达，且包含导航与页面所需的键。
+
+### 13.4 排序（真机，端口 3081）
+
+```
+$ 依次创建 Alpha / Beta / Gamma
+ created alpha Alpha / created beta Beta / created gamma Gamma
+
+$ curl … /custom-mode            → alpha:Alpha | beta:Beta | custom:自定义模式 | gamma:Gamma
+$ curl … -d '{"id":"beta","direction":"up"}' …/custom-mode/reorder
+{"ok":true,"id":"beta","order":["beta","alpha","custom","gamma"],
+ "note":"顺序已保存：新建会话时的模式选择器按这个顺序排列。"}
+$ curl … /custom-mode            → beta:Beta | alpha:Alpha | custom:自定义模式 | gamma:Gamma
+
+$ for d in custom alpha beta gamma; do grep ^order: /tmp/dsh-dev/.agent-presets/$d/preset.yml; done
+custom   order: 3
+alpha    order: 2
+beta     order: 1
+gamma    order: 4
+
+$ curl … -d '{"id":"beta","direction":"up"}' …/custom-mode/reorder
+{"ok":false,"error":"「Beta」已经在最前面。"}
+$ curl … -d '{"id":"custom","direction":"sideways"}' …/custom-mode/reorder
+{"ok":false,"error":"未知的排序方向：sideways"}
+$ curl -o /dev/null -w '%{http_code}' …/custom-mode/reorder     （GET）
+405
+```
+
+顺序落在 `preset.yml` 而不是插件自己的状态里，所以重启后仍生效；`GET` 不会改动它。
+
+### 13.5 客户端 bundle 仍是内容哈希定址
+
+```
+cache-control: public, max-age=31536000, immutable
+rev = artifactRevision(readFileSync(clientPath), { mtimeMs })
+```
+
+改文件 → rev 变 → URL 变。**重启后普通刷新即可**，无需清缓存。
+
+---
+
+## 14. 真浏览器验证（实验机，dsh `0.1.6-alpha.2`）
+
+这是本项目第一次**看见**自己渲染出来的页面。跑 harness 的那台机器（会话机）是**宿主**，不能拿它当
+测试目标——重启它等于杀掉正在跑的会话。所以验证放在一台可以随便重启的实验机上做。
+下面的 `$LAB` 指实验机（操作者自己的 `~/.dsh/AGENTS.md` 里记着它的地址与启动脚本）；
+一份只需要「另一台机器 + 一个浏览器」的通用配方见仓库 `AGENTS.md` 的「The lab」一节。
+
+### 14.1 实验机准备（含 dsh 升级）
+
+```
+$ ssh "$LAB" 'dsh --version'
+0.1.6-alpha.1
+$ ssh "$LAB" 'npm i -g @deepseek-ai/dsh@0.1.6-alpha.2'      # 后台跑，注意 npm 标签坑
+$ ssh "$LAB" 'dsh --version'
+0.1.6-alpha.2
+```
+
+npm 标签有坑：`latest` 停在旧的 `0.1.5-rc.2`，新版在 `alpha` 上；升级很慢（腾讯云镜像），
+必须后台 + 轮询，不要用 ssh 前台等。
+
+```
+# 独立 DSH_HOME + 免首启弹窗的 settings.yaml（只放 onboarding/locale/theme，凭据不出会话机）
+$ ssh "$LAB" 'cd /root/dsh-lab/dsh-custom-mode && DSH_HOME=/root/dsh-custom-lab ./install.sh'
+    组合树 164 行，dsh-custom-mode 已就位
+$ ssh "$LAB" '/root/custom-lab.sh'
+dsh web: http://127.0.0.1:3082/?token=SaOzofZ2…
+```
+
+浏览器：实验机上已有 playwright 的 chromium，
+`/root/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome`，`/root/chrome-lab.sh` 把它以
+`--headless=new --remote-debugging-port=9222` 拉起来：
+
+```
+$ ssh "$LAB" '/root/chrome-lab.sh'
+{"Browser": "Chrome/153.0.8010.12", "Protocol-Version": "1.3", …}
+```
+
+### 14.2 验证结果：21/21
+
+```
+$ ssh "$LAB" 'cd /root/dsh-lab/dsh-custom-mode && CDP_PORT=9222 \
+    node tools/browser-verify.mjs --url "http://127.0.0.1:3082/?token=…" --out /root/custom-mode-verify.png'
+
+PASS  首启遮罩被清掉（否则下面的点击都会被拦）
+PASS  能打开「自定义模式」设置页
+PASS  面板里没有裸翻译键
+PASS  渲染出区块标题「助手」
+PASS  渲染出「新增助手」按钮
+PASS  渲染出「上移」按钮
+PASS  渲染出「下移」按钮
+PASS  渲染出「复制一份」按钮
+PASS  渲染出「导出提示词」按钮
+PASS  渲染出「导入提示词」按钮
+PASS  渲染出系统提示词区块
+PASS  渲染出基础模式区块
+PASS  渲染出插件开关区块
+PASS  每个开关都有可见行标题
+PASS  左侧导航项不是裸键 nav
+PASS  新增后在列表里出现
+PASS  删开风险确认弹窗
+PASS  弹窗里有「我明白」勾选框
+PASS  点「永久删除」
+PASS  删除后从列表消失
+PASS  页面没有报 dsh-custom-mode 的错误
+
+结果: 21 通过, 0 失败
+```
+
+截图取回会话机后**肉眼看图核对**：左侧导航是「自定义模式」；「助手」区块、中英提示、
+`自定义模式` 胶囊、铺满宽度的新建输入框 + 「+ 新增助手」；「模式名称」两个铺满的输入框；
+「上移 / 下移 / 复制一份 / 删除这个助手」四个按钮（只有一个助手时上移下移正确置灰）；
+「基础模式」四个胶囊 + 说明行；「插件开关」两张卡片，**开关旁边有可见行标题**
+（「身份（系统提示词）」「custom_prompt 工具」）。零裸键。
+
+### 14.3 这一轮验证脚本自己踩的两个坑（已修）
+
+- 设置面板本身是 `[role=dialog]`，所以 `querySelector('[role=dialog]')` 拿到的是**面板**而不是
+  确认弹窗 → 断言失败、勾选框被勾上、确认按钮没点到（截图正好记录了这个中间态）。
+  改成**在所有 dialog 里按内容找**。
+- `RiskConfirmation` 的确认按钮读 React 状态，勾选与点击必须在**两个 tick** 里做，
+  否则删除不会发生。
+
+## 15. 在 dsh `0.1.6-alpha.2` 上重新验证（从 npm 安装的版本）
+
+以下全部在一个一次性 `DSH_HOME` 上、对着**已发布的包**做的，不是对着工作区：先把它下载下来与仓库的
+`npm pack` 做过逐字节比对，一致（16 个文件，清单哈希相同）。
+
+### 安装路径，以及它中间绕的那一下
+
+```
+$ dsh plugin --profile web add dsh-custom-mode
++ dsh-custom-mode 0.1.6-alpha.1            ← 而 registry 上 `latest` 是 0.1.6-alpha.2
+
+$ node -p "require('$DSH_HOME/profiles/web/package.json').dependencies"
+{ 'dsh-custom-mode': '0.1.6-alpha.1' }
+```
+
+这是 pnpm 的一天供应链延迟，不是 registry 的问题：pnpm ≥ 11 里 `minimumReleaseAge` 默认 `1440` 分钟，
+alpha.2 发布了 13 小时，alpha.1 是 24.3 小时。装精确版本可以，并把例外记进 `pnpm-workspace.yaml`：
+
+```
+$ dsh plugin --profile web add dsh-custom-mode@0.1.6-alpha.2
+$ node -p "…dependencies"                 → { 'dsh-custom-mode': '0.1.6-alpha.2' }
+```
+
+装到旧版本的现象是看得见的，而且正是播种那件工作要消除的东西：没有 `custom-mode: 已播种` 那行、没有
+`$DSH_HOME/.agent-presets/`，设置页路由回 `{"ok":false,"error":"找不到组成文件：…"}`。
+
+### 已发布的 alpha.2 上
+
+```
+custom-mode: 已播种 preset 到 …/.agent-presets/custom（新建 5 个文件: agent.cordis.yml, preset.yml,
+             prompt.md, prompt-reader.mjs, prompt-tool.mjs）
+GET /custom-mode          → 200 {"ok":true,"assistants":[{"id":"custom","name":"自定义模式",…}],"root":…}
+GET /custom-mode（无 cookie） → 401
+```
+
+`tools/browser-verify.mjs` 对它跑：**21 通过, 0 失败** —— 页面能开、没有裸翻译键、助手区块与它的按钮都
+渲染出来、三个区块都在、每个开关都有可见行标题、新增后出现在列表、删除会弹风险确认、确认后消失，页面
+没有 `dsh-custom-mode` 的报错。
+
+### 多助手（新能力）的磁盘级核对
+
+| 步骤 | 结果 |
+| --- | --- |
+| `POST /custom-mode/create {"name":"writer"}` | id 为 `writer` —— 英文名直接作为目录名 |
+| `POST /custom-mode/create {"name":"写作助手"}` | id 为 `custom-2` —— 不是合法 id 的名字按规则回退 |
+| 每个助手的目录 | `agent.cordis.yml`、`preset.yml`、`prompt.md`、`prompt-reader.mjs`、`prompt-tool.mjs` |
+| 先给 `writer` 写提示词，再给 `custom-2` 写 | `writer/prompt.md` = `WRITER-PROMPT-V2`，`custom-2/prompt.md` = `CUSTOM2-PROMPT`，`custom/prompt.md` 未被触碰 |
+| 各助手的底子模式 | `writer` → `# 基础模式: standard`，`custom-2` → `# 基础模式: minimal` |
+| 手写 preset（`handmade/`：无 `prompt.md`，组成也不走 `prompt-reader.mjs`） | 不在列表里；对它保存会被拒且错误可读；事后它的文件逐字节未变 |
+| `POST /custom-mode/delete {"id":"writer"}` | 目录被删，列表回到两个 |
+| 重启 dsh | 被删的助手**不会回来**；另外两个各自的提示词保住；`handmade/` 仍然未被触碰 |
+
+### 这一轮暴露的两个工具 bug
+
+- `tools/screenshots/screenshots.mjs` 还在找旧控件：开关现在是壳自己的原子组件（`[role=switch]` +
+  `aria-checked`；实测 32 行、32 个开关、**0** 个 `input[type=checkbox]`），保存控件是普通 `button`
+  而不是 `.cpfe-btn`。两处都改掉了，这才让四张 README 图重新可生成。
+- `tools/screenshots/run-shots.sh` 在 `cd` 到 `tools/screenshots/` **之后**才解析输出目录，于是相对的
+  `docs/images` 被创建在工具目录里而不是仓库里。现在先解析成绝对路径再 `cd`；用相对参数重跑验证过，
+  图确实落在 `docs/images/`。
+
+---
+
+## 16. HTTP 路由迁移到平台的带围栏频道（0.1.6-alpha.2，一次性实例）
+
+一次外部的批判性审阅指出：本插件把路由注册在裸 `ctx.webServer` 表上，再自己调
+`ctx.connection.requestRejection`，而平台早已提供带围栏的替代。核实后成立，1.0.3 完成迁移。
+
+### 16.1 先写探针，实测 `/api` 的真实行为（不靠读代码推断）
+
+20 行探针插件（3 条 `/api` 路由，`methods`/`requestBody` 按官方包用法）装进一次性 `DSH_HOME`
+（端口 3094）后：
+
+```text
+GET  /api/rev-probe                   未授权                → 401 unauthorized
+GET  /api/rev-probe                   带会话 cookie          → 200 {"probe":"get-ok",...}
+GET  /api/rev-probe?x=1&y=2           带会话（query 可见）    → {"probe":"get-ok","query":"?x=1&y=2",...}
+POST /api/rev-probe-post              未授权                → 401
+POST /api/rev-probe-post              带会话 + JSON body     → 200 {"probe":"post-ok","got":{"a":1}}
+POST /api/rev-probe-post              带会话 + 坏 JSON       → 400（我们自己的 handler 给的消息）
+GET  /api/rev-probe   Origin: https://evil.example + Sec-Fetch-Site: cross-site → 403
+GET  /api/rev-probe   Host: evil.example                     → 403
+POST /api/rev-probe   （该路由只声明 GET）                    → 404（根本没进 handler）
+GET  /api/rev-probe/nope   未注册的子路径                     → 404
+GET  /rev-probe       （旧的裸路由风格）                      → 404
+```
+
+**两条容易踩错的事实**：注册的 `path` 必须**含 `/api` 前缀**（官方包传 `/api/present.host`、
+`/api/changes.summary`；类型注释那句 "below /api" 说的是 URL 空间 —— 我第一次写成 `/rev-probe`，
+拿到 404）；方法未声明时平台**不分发**，返回 404 而不是 405。
+
+### 16.2 迁移后（`/api/custom-mode*`，端口 3095）
+
+```text
+GET  /api/custom-mode                   未授权                → 401 unauthorized
+POST /api/custom-mode/state             未授权（JSON body）    → 401，prompt.md md5 未变
+GET  /api/custom-mode                   带会话                → 200 {"ok":true,"assistants":[…]}
+GET  /api/custom-mode                   带会话 + 跨站 Origin   → 403
+GET  /api/custom-mode                   Host: evil.example    → 403
+GET  /custom-mode                       （旧的裸路由）          → 404
+POST /api/custom-mode/state             带会话                → 200 已保存；prompt.md 与组成文件都写了
+```
+
+浏览器半（真浏览器 + CDP）：`tools/browser-verify.mjs` **21 通过 / 0 失败** —— 增删往返、风险确认弹窗、
+语言与主题切换在新路径下照常。
+
+代码侧的结构断言（`test/editor-route.test.mjs`）：5 条精确路径都注册在 `connection.fetch` 上、
+`requestBody: 'buffered'`、`create`/`delete`/`reorder` 只声明 POST；源码里**不再有**
+`requestRejection(` 调用与 `webServer.register(`；等不到 `connection` 时**一条也不注册**。
+
+---
+
+## 17. 会话内改写提示词走平台审批缝（0.1.6-alpha.2，真实会话实测）
+
+用户提出的需求：会话内的 `custom_prompt` 工具能覆盖整个系统提示词，而调用它的可能是被注入的模型 ——
+这条路径此前没有任何门。做法是注册 `tools/pre-execute`（waterfall）并在 `action === "write"` 时返回
+`{kind:'ask'}`，由平台的审批策略决定后续。
+
+### 17.1 先探针，别照类型注释猜
+
+用一个 20 行探针插件（只注册监听、返回 `ask`）在一次性实例上跑真实会话：
+
+```text
+[ask-probe] 已注册 tools/pre-execute 监听
+$ 会话里：请用 custom_prompt 工具把系统提示词改成：审批测试第一版。只用一次工具调用。
+# 权限预设 = danger-full-access（approval: never）时：
+工具调用Error: the user rejected tool "custom_prompt"          ← 不弹窗，直接判为拒绝
+思考The user rejected the tool call. I should stop and explain.
+（prompt.md 未被修改）
+
+# 权限预设 = workspace-write（approval: ask）时：
+工具调用 custom_prompt · write
+等待审批
+ask-probe：改系统提示词前需要你确认          ← 我们给的理由被原样呈现
+[拒绝] [允许一次]
+# 点「允许一次」之后：
+已生效：系统提示词已改为 审批实测通过。
+（磁盘：/…/.agent-presets/custom/prompt.md 内容变成 审批实测通过）
+```
+
+**两条结论**：`ask` 会不会弹窗由**审批策略**决定（`never` → 不弹、直接拒绝；`ask` → 弹面板）；
+因此这条闸门的最坏情况是"改不成"，而不是"悄悄改成了"。
+
+### 17.2 换上我们自己的闸门后复验
+
+```text
+面板文案：等待审批
+          把「自定义模式」的系统提示词整体替换为 7 字符：审批实测通过。（写入 /tmp/…/prompt.md）
+          [拒绝] [允许一次]
+点「允许一次」 → 工具执行，磁盘变成 审批实测通过。（agent 也如实汇报了写入位置与影响范围）
+点「拒绝」     → prompt.md md5 前后一致（fb6bdc8c…），文件未被修改
+```
+
+浏览器验收（`tools/browser-verify.mjs`）另有 38 项覆盖设置页侧；审批这条链路必须真会话才能验，故记录在此。
+
+上面这个序列是人工从「轨迹」页读出来的；`tools/session-trace.mjs`（本次之后新增）把同一份证据变成一条命令
+—— `node tools/session-trace.mjs --home <那个 home> [--summary]` —— 并给出按工具分类的计数，例如能直接看出
+一次改动用了**一次**还是**两次**调用。
+
+---
+
+## 18. 模型在环深测（0.1.6-alpha.2，测试账号 token，一次性实例）
+
+用真实模型会话（`DeepSeek-V4.1-Flash`）验证那些**只有真会话才能验**的契约。本节的结论与"未结论"分开写。
+
+### 18.1 已验证
+
+1. **审批闸门的三条路径**（原始输出见 §17）：策略 `ask` + 允许 → 真的写入；`ask` + 拒绝 → 文件 md5 不变；
+   策略 `never` → 不弹窗、直接拒绝。闸门最坏是"改不成"，从不是"悄悄改成了"。
+2. **`{{model}}` 在注入时被替换成宿主真实模型 id**：会话自述"我现在的身份要求是：作为由
+   `deepseek-flash` 模型驱动的编码 agent……" —— 模板里写的是 `{{model}}`，宿主渲染成了真实 id。
+   （历史上这一条最容易被写错：界面显示名 ≠ 真实 id。）
+3. **未注册变量不会炸会话**：手工把 `prompt.md` 写成含 `{{nope}}` 的文本后提问，会话照常回答
+   （1+1 → 2）。设置页会拒绝保存这种文本，但文件被别的途径写坏时不应该连会话一起带走。
+4. **会话的 preset 归属**：新建会话取 `settings.yaml` 的 `agent-presets.default`（实测把默认改成
+   `custom` 后，新会话的模式就是「自定义模式」）；而**已经出过内容的会话不能换预设**（与上游文档一致，
+   也是自动化里最容易踩的坑：往旧会话里发消息，验的是别的模式）。
+
+### 18.2 热更新契约：**成立**（而且我第一次测错了，这里记录错在哪）
+
+**结论**：在一条**已经出过内容**的会话里改写 `prompt.md`，**下一步就生效** —— 这一条上面 §0 的承诺得到独立复现。
+
+干净的实验（一次性实例，`0.1.6-alpha.2`，`deepseek-flash`，会话模式确认是「自定义模式」）：
+
+```text
+[轮 1] 先问一次，此时 prompt.md 里没有标记规则
+  提问：5+5 等于几？
+  回答：5 + 5 = 10                      ← 回答里没有标记（干净基线）
+
+[写入规则] 把带标记的格式规则写进 prompt.md（同一个会话，不改任何别的东西）
+
+[轮 2] 同一会话再问
+  提问：6+6 等于几？
+  回答：[[MARKER-7F3A]]                 ← 首行就是规则要求的标记
+        6 + 6 = 12
+  页面里还出现了平台自己打的标注：**「系统提示词更新」**
+```
+
+**我第一次测出来的"不生效"是测试设计的错，值得记下来**：那次的顺序是"先写入规则问一轮（回答里就有标记）→ 撤掉规则再问"，
+后两轮的回答里仍有标记。我当时判断为"会话冻结在挂载时那份提示词"，但真正的原因是**模型在模仿自己上文里的
+标记**（few-shot 自我模仿），与系统提示词是否更新无关。教训：验证"提示词是否变化"时，**基线那一轮里绝不能出现
+要观察的特征**，否则后面看到的都可能是模仿。
+
+另外这也解释了 `/custom_prompt` 工具的 write 为什么必须**只改草稿/落盘而不动会话**：热生效由平台在下一步重读
+系统提示词来完成，插件不需要（也不应该）去插手会话状态。
+
+
+---
+
+## 19. 从一次真实会话，到一条会失败的检查（0.1.6-alpha.2，真实会话）
+
+轨迹读取器的存在，是为了让"模型调了这个工具一次／两次"**可被核对**而不是只能被声明。把这条环路在真机上跑通时，
+它又暴露了读取器自己的一个 bug —— 这正是"要用真实日志跑，而不是只跑合成数据"的意义。
+
+```text
+$ node tools/session-trace.mjs --home /tmp/dsh-exp-… --expect 'custom_prompt(read)=1'   # 第一次：假失败
+会话 session-6f22e6f7-…：1 次工具调用
+     1 × custom_prompt
+  ✗ custom_prompt(read)：期望 1，实际 0
+
+# 原因：真实日志里 data.arguments 是 **JSON 字符串**（"{\"action\": \"read\"}"），不是对象。
+# 读取器只认对象 → 静默丢掉 action → 计数键退化成 custom_prompt（合成测试用的是对象，所以没暴露）。
+
+$ node tools/session-trace.mjs --home /tmp/dsh-exp-… --expect 'custom_prompt(read)=1'   # 修好之后
+会话 session-6f22e6f7-…：1 次工具调用
+     1 × custom_prompt(read)
+  ✓ 1 条期望都成立        （退出码 0；写错成 =2 时退出码 1）
+
+$ node tools/session-trace.mjs --home /tmp/dsh-exp-…
+工具调用（按时间）：
+  t1/s1  custom_prompt {"action":"read"}
+```
+
+`--compare <A> <B>` 是同一件事的横向版本：两边各读一次，输出按 |Δ| 排序的差值表（例如换实现后
+"总调用数 +0，custom_prompt(append) 1 → 1"）。
+
+---
+
+## 20. 稳定线上模式从所有选择器里消失（由外部审阅报告，已复现、已修）
+
+**现象**：在 `0.1.5-rc.2`（npm `latest` 那条线，也就是多数用户的默认）上，新建会话的模式选择器里**完全看不到**
+「自定义模式」；而设置页照常能打开、能操作。
+
+**根因，本地复现**：
+
+```text
+$ grep -n -A2 "workflow-ptc" editor/preset/agent.cordis.yml     # 我们打包的播种模板
+    - id: workflow-ptc
+      name: '@deepseek-ai/dsh-workflow-ptc'
+
+$ ls /tmp/dsh-stable3/node_modules/@deepseek-ai/ | grep -c workflow-ptc
+0                                                                # 稳定线根本不提供这个包
+$ grep -c workflow-ptc <预览线>/presets/standard/agent.cordis.yml
+2                                                                # 预览线提供
+```
+
+一个**启用状态**的行如果解析不到对应插件，平台健康检查会把整个预设判为 broken，而 broken 预设会被选择器
+丢弃 —— 且是静默的，因为设置页从不需要"预设可被解析"。我们的播种模板当初是从**预览线**渲染出来的，因此带了
+这一行。
+
+**为什么双线 CI 没抓到**（审阅的判断，成立）：稳定线任务跑的是套件，覆盖文本手术、路由、词典 —— 没有一条在问
+"这个预设在这条线上健康吗"；而 UI 验收只在预览线上跑、且只跑设置页，从没跑过选择器。
+
+**修法**：播种的组成文件不再照搬打包文件，而是**按本机实际安装的那条线渲染**（`editor/seed.mjs` 的
+`starterComposition()`），只有读不到出厂组成时才退回包内模板；`install.sh` 干脆不再复制组成文件，让首次激活
+写出派生结果。`test/seed.test.mjs` 新增一条检查：逐行确认派生结果里**未禁用**的行的包在本机安装里能解析；
+在稳定线上它会打印出包内模板自己的问题，也就是它挡住的那个 bug：
+
+```text
+说明：包内模板在本线有 1 处不可解析（workflow-ptc → @deepseek-ai/dsh-workflow-ptc）—— 这正是播种改为"按本线派生"的原因。
+```
+
+**在稳定线上验证**（一次性 `DSH_HOME`，从工作树安装插件，端口 3108）：
+
+```text
+$ ls $DSH_HOME/.agent-presets/custom/
+agent.cordis.yml  preset.yml  prompt-reader.mjs  prompt-tool.mjs  prompt.md
+$ grep -c workflow-ptc $DSH_HOME/.agent-presets/custom/agent.cordis.yml
+0
+$ node tools/picker-probe.mjs <url>           # 用 CDP 打开新建会话的模式选择器
+  当前模式按钮: {"text":"自定义模式"}
+  选择器里的模式: ["自定义模式","标准模式","PTC 模式","极简模式"]
+  ✅ 稳定线上「自定义模式」出现在选择器里
+```
+
+---
+
+## 21. 插件行列表按 shell 自己的插件页重建（`1.8.0`）
+
+用户反馈："一行行的标注文字太占地方，间距也不统一，有的也不换行，那么大一长条就甩在下面。"改动前实测
+（设置页、1440×1200 视口、33 行）：
+
+```text
+行数 33   宽度 274px（auto-fill 网格、两列）   行高 84–117px（参差）
+第二行：裸露的行 id（`tool-bash`、`tool-fs-search`、`planning`……）或换行后的说明
+```
+
+shell 自带的插件页（侧边栏 → 插件）是**每个插件一行**：图标、标题行（带标签）、**截断成一行**的说明，
+开关在最右；实测行高统一 66px。
+
+重建后（同视口、同数据）：
+
+```text
+行数 33   布局：一行一个   行高 56 / 58px   横向溢出：0
+折叠时的第二行：说明，固定一行，超出用省略号（`title` 给全文）
+```
+
+「详情」下拉在真实页面上核对过：
+
+```text
+$ node tools/browser-verify.mjs --url …            # 49 项（原来 44）
+  PASS  每行都不高于 64px（紧凑、不再是大长条）
+  PASS  行高统一（最高与最低相差 ≤ 8px）
+  PASS  没有行横向溢出（说明文字截断而不是撑破）
+  PASS  每行都有详情开关
+结果: 49 通过, 0 失败
+```
+
+展开后的 DOM 读数（用 CDP 读的；自动**点击**这一条刻意没有放进套件 —— 在 WSL 的 headless 实验室里，
+指针点击用的坐标偶尔会和重渲染竞争，而一条偶发失败的断言比没有更糟）：
+
+```text
+展开后的详情: "行 id | persona | 说明 | 提示词注入点；关掉后本模式用回部署默认身份 | 开关状态 | 未改动（跟随官方默认）"
+```
+### 同一轮的后半：段落说明与描述框
+
+同一份反馈里的另外两件事 —— 四段说明每段都以一整段文字开场，而描述框会把自己的内容截掉：
+
+```text
+改前：助手 / 模式名称 / 基础模式 / 插件开关  →  每个控件上方都压着 60–120 字的整段说明
+      描述框：单行输入、内容是双语的，界面上只显示到「完整编码能力… / Ful」   ← 被截断
+改后：每段只有一行提示，右侧一个 ▸ 展开完整说明
+      描述框换成随内容长高的 textarea（实测：scrollHeight <= clientHeight，即没有隐藏内容）
+```
+
+段落说明复用插件行的语言（一行 + 按需展开），也复用同一个展开状态表 —— 页面上只有一套交互，而不是两套。
+
+**这次浏览器验收真的值回票价**：13 个套件全绿的同时，设置页其实**崩了两次**，两次都来自这次改动 ——
+
+```text
+[error] slot entry crashed in 'settings.section': ReferenceError: Cannot access 'draft' before initialization
+[error] slot entry crashed in 'settings.section': TypeError: Cannot read properties of null (reading 'description')
+```
+
+第一处是把 `useEffect` 放在了它所读取的 `draft` 声明之前；第二处是在没有选中助手（`draft === null`）时读了
+`draft.description`。两处单元测试都看不见，而第二处正是"页面静默不出现"那一类 —— 本仓库以前吃过一次。针对这两条
+反馈新增了四条检查（提示是一行、提示有展开开关、描述是 `TEXTAREA`、描述没有被截断）：49 → **53** 项。
+
+
+---
+
+## 22. 评审驱动的迭代轮次花了多少（token 记账）
+
+用户给出了客户端自己的计数器 —— 把四份外部审阅变成 `1.4.0` – `1.9.0` 这些版本的那一轮：
+
+```text
+未缓存输入        3,973,904 tok
+缓存读取        711,962,624 tok
+输出              1,559,791 tok
+```
+
+README「构建所用」一节里用的算式（与第一遍同一套公式，两笔账才可比）：
+
+```text
+本轮合计     3,973,904 + 711,962,624 + 1,559,791 = 717,496,319 tokens
+本轮命中率   711,962,624 / (3,973,904 + 711,962,624) = 99.44%
+项目累计     126,287,613 + 717,496,319 = 843,783,932 tokens
+项目命中率   (125,638,016 + 711,962,624) / (125,862,074 + 715,936,528) = 99.50%
+```
+
+
+---
+
+## 23. 三份审阅一轮处理：哪些成立、哪些说错了（1.9.1）
+
+三份独立审阅同时到达。它们的共同发现 —— 文档漂移 —— 每一条都成立；而它们关于仓库状态的三个说法里，有三个是错的。
+两个方向都记下来：审阅本身也是证据，而这个文件就是放证据的地方。
+
+**核对后证伪的说法**
+
+```text
+说法："没有 GitHub Releases（只有 tag）"
+$ gh release list --limit 20 | head -4
+  v1.9.0 … v1.8.0 … v1.7.1 … v1.7.0 …            ← 从 v1.3.0 起共九个 release
+→ 错；审阅看的是过期页面。
+
+说法："SECURITY.md 写着 1.0.0–1.0.6，而实际只到 1.0.4"
+$ curl -s https://registry.npmjs.org/dsh-custom-mode | …versions…
+  0.1.6-alpha.1, 0.1.6-alpha.1.rev1, 0.1.6-alpha.2, 1.0.0, 1.0.1, 1.0.2, 1.0.3, 1.0.4, 1.1.0 … 1.9.0
+→ 表里的范围确实写错（应为 1.0.0–1.0.4）；这条审阅是对的。它还指出"两行都标成当前目标"，那也确实存在。
+
+说法："并发 GET /state 会交错或丢失历史记录"
+→ 单进程内不成立：追加是同步的（writeFileSync + rename），而 Node 一次只跑一个回调，两个处理器无法在中间交错；
+  原子改名也保证读者看不到写了一半的文件。跨进程共用同一个 DSH_HOME 的竞争是另一回事，已记录为范围外。
+```
+
+**确认并已修**（细节见 CHANGELOG）：那张 D1–D8 文档对照（CONTRIBUTING 里已移除的旧架构、PR 模板的三条过期项、
+SECURITY 支持表、README 钉在 `@1.7.0`、`test/README.md` 的"8 套件/333"示例）、模式选择器里的双语拼接描述
+（`1.7.0` 的回归）、只在某一条 dsh 线上成立的行标注默认状态、切换底子未保存时的沉默、只信 `content-length` 的
+请求体上限、以及 journal 的第三份原子写拷贝。
+
+**这一轮之后的数字**
+
+```text
+node test/run.mjs                    13 套件，667 项        （原 662）
+tools/browser-verify.mjs             56 项                 （原 53）
+tools/verify-doc-numbers.mjs         ✓ 13 / 667 / dsh 范围 / 版本 1.9.1
+tools/verify-translation-pairing.mjs ✓ 双语配对 + 语言纯度
+```
+
+---
+
+## 24. 第三份审阅的 P0（"两条线都 REQUEST_EXTENSION"）——**不复现**（2026-09-19）
+
+那份审阅说：任意自定义模式助手发任意消息，约 2 秒即
+`DeepSeek request extension preparation failed / REQUEST_EXTENSION`，alpha 与 stable **两条线都复现**，
+而同实例切官方「标准模式」正常回复。
+
+我们每条线各跑了一次真会话复核（各自一次性 `DSH_HOME`，插件分别取工作树与 **npm 上的已发布版本**）：
+
+| 线 | 宿主 | 插件 | 结果 |
+| --- | --- | --- | --- |
+| 预览 | `0.1.6-alpha.2`（本机全局） | 工作树 1.9.2 | **正常回复**（8.7K tok，1 轮 1 步） |
+| 稳定 | `0.1.5-rc.2`（临时前缀） | **npm 1.9.2**（钉版本安装） | **正常回复**（8.8K tok）；播种文件里 `workflow-ptc` 行数 **0** |
+
+稳定线那次的页面尾部原文：
+
+```text
+… 用量 8.8K tok / 用时 1秒 / 1 轮 1 步·256 tok/s …
+```
+
+也就是说**请求准备阶段通过了** —— 否则先出现的是扩展错误，而不是正常回复。
+
+补充证据：派生播种文件的行清单与包内模板**等价**（20 vs 19 行，多出来的是本线出厂自带的 `tool-plugin-manager`），
+插件自带的可解析性检查在两条线上都报 **0 行无法解析**。
+
+**结论：在本机、两条线上均不复现。** 审阅看到的现象可能是其环境特有（例如 API 端点/凭据问题在准备阶段的表现，
+或当时装的 1.9.0 搭配了更早的组成文件）。它的宿主日志可以定性 —— 本仓库不会因为"我们复现不了"就当它不存在。
+
+---
+
+## 25. 社区目录收录状态（2026-09-19）
+
+已收录：`awesome-dsh-plugin/awesome-dsh-plugin`、`imsai-sh/awesome-deepseek-harness-plugins`、
+`unStone/dsh-xray`、`anbeime/skill`。
+
+本轮提交：
+
+```text
+bruc3van/awesome-dsh-plugin#123   SHOWCASE.md 的「作者自荐」与「Author showcase」各加一行（自动抓取 + 人工复核的清单）
+beancookie/awesome-dsh-plugin#183 README.md 与 README.en.md 的「🧑💻 开发与运行时 / Development & Runtime」各加一行
+```
+
+自动收录：`AdamPlatin123/dsh-plugin-radar` 明说"带 `dsh-plugin` topic → 8 小时内自动收录"；本仓库一直带着这个 topic，
+所以只是时间问题。
+
+未跟进：`Alex-Yanggg/awesome-DSH-plugin`（最后更新 2026-08-15，已停更）与 `diegosouzapw/awesome-omni-dsh-plugins`（★17）。
+
+---
+
+## 26. 第二轮外部评审（2026-09-19）—— 11 条属实、2 条证伪
+
+四位评审者用的是操作者工程规范目录里的**评审套件**（本仓库的 README/AGENTS/MEASUREMENTS + 一份要求
+"给证据、标护栏覆盖、限长清单"的提示词）。与第一轮不同，这次每条发现都带命令与原始输出，其中 11 条在本机
+复现。`1.9.3` 修复：
+
+| 严重度 | 发现 | 修法 |
+| --- | --- | --- |
+| P1（安全） | 升级从不刷新助手目录里的**代码模块**，1.0.x/1.1.x 首装的用户永远留着没有审批闸门的 `prompt-tool.mjs` | `prompt-reader.mjs` / `prompt-tool.mjs` 内容不一致即刷新（原子写）；`prompt.md`、`preset.yml` 与生成的组成文件仍只补不缺 |
+| P1 | `install.sh` 仍在复制包内那份组成文件（只按一条 DSH 线渲染）→ 另一条线把预设判为 broken，模式从选择器消失 | 安装脚本不再复制；改由插件按本线派生 |
+| P1（护栏） | `tools/picker-probe.mjs` 找的是 `Standard`，而英文界面渲染 `Standard mode` → 探针根本找不到选择器 | 名字表补上英文实际文案 |
+| P1（护栏） | `tools/browser-verify.mjs` 假定中文界面：英文冷启动产出约 20 项莫名其妙的失败 | 先打开 Settings 并把界面切成中文；切不动就**明确报错退出**（已在英文实例上实测：57 项、0 失败） |
+| P2 | 「按本线修复」不是纯就地手术：会重写 persona 段，丢注释或多复制身份行 | 只有完整重新渲染才替换该段（`replacePersona`） |
+| P2 | 播种用裸 `copyFileSync` → 两个实例共用一个 `DSH_HOME` 时 Windows 上 `EBUSY` | 所有写入统一走共享原子写helper |
+| P2 | 被平台静默丢弃的模式只在设置页可见 | 激活时宿主日志告警，带行 id 与处置建议 |
+| P2/P3 | 英文词典泄漏：中文括号、中文顿号分隔符、字面 `**` | 只在 `en` 对象里清理（词典漂移检查锁住两份拷贝 —— 这轮它抓到了我自己两次失误） |
+| P3 | `POST /state` 会清空请求里没带的描述；`publishConfig.tag` 是 `alpha` | 描述保留；tag 改为 `latest` |
+
+证伪（附证据）：那条"模式出现在选择器里但点了没反应"的 P1（切换后新建会话的 `agentPreset = custom`，
+读的是会话记录而不是界面），以及此前那条 `REQUEST_EXTENSION` P0（又四位评审、又多六次会话，仍不复现）。
+
+套件后续：`05-项目已有护栏.md` 需要写明"护栏自己也有盲区"—— 英文 locale 这一条就是。
+
+## 27. 原生 `0.1.7-rc.2` 上的对抗性审阅：设置页是一个 500（2026-09-25）
+
+**环境。** ACUS04（`ssh acus04`）：node 24.21.0，全局装 `dsh 0.1.7-rc.2`，一次性
+`DSH_HOME=/root/dsh-custom-lab`、一次性 web profile，Chromium 153（playwright 版）走 CDP。代码树用
+`tar --exclude=node_modules --exclude=.git` 送过去；**服务用户的那台机器从未被碰过**。
+
+**修复前（1.9.12）**，同一实例、同一份代码：
+
+```
+GET  /api/custom-mode            → 200 {"ok":true,"assistants":[{"id":"custom",…}]}
+GET  /api/custom-mode/state?id=custom
+     → 500 {"ok":false,"code":"internalError","params":{"detail":"无法定位出厂基础模式。已尝试：agentPresets 的
+       system 预设路径、Node 解析、profile 的 node_modules。…"}}
+POST /api/custom-mode/state      → 400 {"code":"renderFailed","params":{"detail":"无法定位出厂基础模式…"}}
+POST /api/custom-mode/create     → 400 {"code":"renderFailed","params":{"detail":"无法定位出厂基础模式…"}}
+POST /api/custom-mode/repair     → 200 {"code":"repairNotNeeded"}
+GET  /api/custom-mode/repair     → 404（方法表正确）
+```
+
+`node tools/browser-verify.mjs` → **10 PASS / 7 FAIL**，随后死在 `fill(.cpfe-editor) found nothing`
+（提示词编辑器根本没渲染）。`node tools/picker-probe.mjs --expect 自定义模式` → **exit 0**：模式在选择器里，
+这正是"所有看选择器的检查都发现不了它"的原因。
+
+**根因一句话：** 读出厂组成只有一条路 —— `require.resolve('@deepseek-ai/dsh-agent-presets/package.json')`，
+而 0.1.7 不发布这个包。
+
+**证明这就是根因（同一实例，只多一个环境变量）**：加上
+`DSH_SHIPPED_PRESETS_DIR=<0.1.6-alpha.2 的 presets 目录>` 之后：
+
+```
+GET  /api/custom-mode/state      → 200（rows/modes 全回来）
+POST /api/custom-mode/state      → 200 {"code":"saved"}
+POST /api/custom-mode/create     → 200 {"code":"created"}
+browser-verify                   → 30 PASS / 0 FAIL，随后 CDP 驱动卡死
+                                   （CDP timeout: Input.dispatchMouseEvent —— 是浏览器，不是产品）
+```
+
+**修复所走的那条路。** 0.1.7-rc.2 上 `agentPresets.readDocument('standard')` 返回：
+
+```
+{ "agentPreset": "standard",
+  "content": "- id: persona\n  name: '@deepseek-ai/dsh-persona'\n  config:\n    suffix: …\n- id: plan…" }
+```
+
+—— 入口列表 YAML，`isolate` 分组与 `!!js` 都在，正是合成器要编辑的形状。`compositionInventory()` 不能
+替代：同一实例上它把行压平成 `{entryId, moduleName, enabled, condition, fiberState}`（standard 29 行、
+没有分组），`parse-composition.mjs` 早已据此排除了它。
+
+**以及 CI 为什么没看见。** `GET /repos/BOWLUNA/dsh-custom-mode/actions/workflows/test.yml/runs` 显示
+1.9.10、1.9.11、1.9.12 三次 push 都是 **failure**，失败任务是
+`test (ubuntu-latest, 24, 0.1.7-rc.2)`，失败步骤是 `安装 DSH（并准备测试夹具的 presets 目录）` ——
+三条 0.1.7 腿全红，而 `0.1.5-rc.3` 与 `0.1.6-alpha.2` 通过。在干净目录里复现：
+
+```
+npm install --no-save @deepseek-ai/dsh@0.1.7-rc.2                  # 成功
+npm install --no-save @deepseek-ai/dsh-agent-presets@0.1.6-alpha.2 # npm error code ERESOLVE
+```
+
+在 GitHub 的 `bash -e` 下，安装失败就是**这一步失败**，所以那几条腿一个测试都没跑。而 `release.yml`
+发布前只装 `0.1.6-alpha.2` —— 绿灯的发布闸门与三条红腿因此共存了三个版本。
+
+## 28. 0.1.7-rc.2 上的浏览器闸门 —— 挡掉 27 项检查的，是一个原生对话框（2026-09-25）
+
+背景：1.9.15。三个只有"渲染后的页面"才看得见的问题。所有命令都在第二台机器的一次性 `DSH_HOME` 上跑，
+dsh `0.1.7-rc.2`，`chrome-headless-shell`，CDP 在 9222。
+
+**1. `window.confirm` 会把渲染进程冻住 —— 这就是闸门停在 30/57 的原因。**
+
+```
+$ CDP_PORT=9222 node tools/browser-verify.mjs --url "http://127.0.0.1:3082/?token=…"
+PASS  新增后在列表里出现
+file…/cdp.mjs:69
+Error: CDP timeout: Input.dispatchMouseEvent
+```
+
+那条 PASS 之后的一步就是删除。对冻住的页面探测：
+
+```
+[+    1ms] trivial evaluate (before): 2
+[+ 8002ms] delete click: __TIMEOUT__          ← 点击处理函数再也不返回
+[+ 6001ms] trivial evaluate (after delete click): __TIMEOUT__
+top -bn1 | grep chrome  →  0.0 % CPU          ← 是阻塞，不是空转
+```
+
+用 CDP 关掉对话框后它立刻恢复，于是原因确定：
+
+```
+handleJavaScriptDialog 成功? yes
+关掉对话框之后的渲染进程: alive:2
+```
+
+也就是说页面当时停在原生 `confirm()` 里：它**同步阻塞渲染进程**，而 headless 浏览器没有人去点它，
+于是此后每条 CDP 命令都超时。现在 `tools/screenshots/cdp.mjs` 自己接管 `Page.javascriptDialogOpening`
+并留痕（`session.dialogs`）。
+
+**2. 这条线上的删除本身是坏的 —— 而任何单元测试都看不见。**
+
+```
+POST /api/custom-mode/delete {"id":"custom-2"}  → 400 {"ok":false,"code":"noRemoveApi", …}
+$ ls $DSH_HOME/.agent-presets/  →  custom  custom-2      ← 还在
+```
+
+声明式线上没有 `agentPresets.remove()`（注销 = `register()` 返回的 disposer），而宿主那半却要求这个 API。
+现在声明式后端自己注销并删目录；新增的 `test/preset-backend.test.mjs`（15 项）钉住它。
+
+**3. 这条线上壳没有把原子库交给第三方客户端插件。**
+
+面板里的 `Button/Input/Switch/Tag/Pill` 来自插件自带的回退控件集，所以行开关是
+`input[type=checkbox]`，而不是壳的 `[role=switch]`。在渲染后的面板上实测：
+
+```
+{ "text": "基础压缩 已启用 ▸", "switches": 0, "inputs": 1, … }   （每行一条）
+```
+
+`browser-verify` 的开关断言现在两种形态都认（并要求至少渲染出一种），于是闸门在两条线上都过，
+而不是只在"恰好提供了原子库"的那条线上过。
+
+**三处修完之后，同一实例上连跑两次：**
+
+```
+$ CDP_PORT=9222 node tools/browser-verify.mjs --url "…"
+结果: 58 通过, 0 失败          （第 1 次）
+结果: 58 通过, 0 失败          （第 2 次）
+$ ls $DSH_HOME/.agent-presets/  →  custom        ← 新建/删除往返没有留下任何残留
+```
+
+
+## 29. 「看着廉价」的根因是一行 JavaScript（2026-09-25，1.9.16）
+
+背景：设置页与 dsh 其它页面的观感明显不像一个产品。实测环境：一次性 `DSH_HOME`、dsh `0.1.7-rc.2`、
+Chromium 153 over CDP。
+
+**1. 原子库探测写错了。** 页面用 `typeof atoms.Button === "function"` 判断壳有没有交出组件，而壳的组件是
+`forwardRef(...)` **对象** —— 于是判定失败，页面悄悄用了自己那套朴素控件。实测 `require` 真正返回的东西：
+
+```
+__CM_RAW = {"type":"object","keys":279,
+            "first":["BrandWordmark","Button","CODE_HIGHLIGHT_EXTENSIONS","Checkbox","CodeBlock",…],
+            "button":"object"}          ← 对象，也就是 forwardRef
+$ grep -o 'function WS(){return{.*}}' frontend/index-*.js
+function WS(){return{react:yf,"react/jsx-runtime":jf,…,"@deepseek-ai/dsh-client-ui-primitives":qb,…}}
+```
+
+也就是说这个模块**一直在**平台的种子表里。把判据改成「React 能渲染」（`$$typeof`）之后，渲染出来的页面从
+**0 个 `[role=switch]` / 33 个手绘 checkbox** 变成 **33 个 `[role=switch]` / 0 个 checkbox**，图标也出来了
+（此前根本没渲染：页面要 `IconPlusOutline16`，壳导出的是 `IconPlusOutlineRegular`）。
+
+**2. 我们自己的 CSS 用的是另一套尺度。** 在同一实例上实测官方「通用设置」页与我们的页面：
+
+```
+官方区块标题   14px/22px w500          我们（改前）15px/22px w700
+官方区块引言   12px/18px tertiary      我们（改前）每个标题右边一个可折叠圆点
+官方设置行     padding:16px 0，无背景无圆角，行间 1px 分隔线
+我们（改前）   每行一个圆角描边带底色的卡片（radius 10、0.5px + bg-layer-1）
+官方下拉       灰底按钮 + chevron + Menu 浮层（padding 0 8px、radius 8）
+我们（改前）   助手是一排药丸；历史是原生 <select>
+```
+
+对齐之后，`tools/browser-verify.mjs` 把这些数字写成断言，防止再漂回去：「区块标题 14px/22px/500」
+「引言 12px/18px tertiary」「行是扁平的（无圆角、无底色）」「行用 padding 16px 0」「行间 1px 分隔线」
+「行开关必须是壳的 `[role=switch]`、手绘 checkbox 0 个」。整道闸门在 `0.1.7-rc.2` 上 **65/65**。
+
+截图：`docs/images/`（由这一版重新生成）与 `editor/assets/storefront-0*.png`。
+
+## 30. 桌面端已经在仓库里，而未声明的 0.2.0 并不存在（2026-09-27）
+
+起因是一个问题：听说 dsh 0.2.0（含桌面端）快发了，插件或许能提前适配 —— 会不会其实已经发布、只是没声明？
+2026-09-27 实测：
+
+```
+$ npm view @deepseek-ai/dsh dist-tags
+{ "latest": "0.1.7-rc.2", "alpha": "0.1.7-alpha.2", "next": "0.1.7-rc.2" }
+$ npm view @deepseek-ai/dsh versions --json | tail
+... 0.1.7-alpha.1, 0.1.7-alpha.2, 0.1.7-rc.1, 0.1.7-rc.2        （共 27 个版本，没有任何 0.2.x）
+$ curl -s https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/package.json | head -3
+{ "name": "@deepseek-ai/dsh-root", "version": "0.1.7-rc.2", ...
+$ gh api repos/deepseek-ai/deepseek-harness/git/refs/tags --jq '.[].ref' | tail -2
+refs/tags/dsh-v0.1.7-rc.1
+refs/tags/dsh-v0.1.7-rc.2
+```
+
+所以并没有「未声明的 0.2.0」可适配：npm 上的运行时、仓库 master 的版本号、最新 tag 全是 0.1.7-rc.2。
+但仓库里**已经有桌面端**：
+
+```
+apps/desktop/package.json       "@deepseek-ai/dsh-desktop"       0.1.7-rc.2   "private": true
+apps/desktop-host/package.json  "@deepseek-ai/dsh-desktop-host"  0.1.7-rc.2   "private": true
+```
+
+两者都是 private 包，所以它们以签名的 Electron 安装包发布、不在 npm 上。桌面端是「套了 Electron 壳的完整 Web 应用」，
+而它的发布身份规则是：Electron 与 `@deepseek-ai/dsh` 永远同一个精确版本。也就是说桌面端**现在**就是一个可以
+支持的目标，不用等 0.2.0 —— 前提是按应用允许的方式安装插件。
+
+桌面端独占 `$DSH_HOME/profiles/desktop`，而且这不是约定，CLI 在运行时就被拒：
+
+```
+$ DSH_HOME=/root/dsh-desktop-lab dsh plugin --profile desktop add ./editor
+error: profile "desktop" is managed exclusively by the Electron application
+```
+
+`install.sh` 现在也会拒绝同一个 profile 并给出同样的建议（**在应用内的 Plugins 页安装**；
+`DSH_ALLOW_DESKTOP_PROFILE=1` 只用于本机模拟该 profile 形状），于是脚本与运行时口径一致，而不是某一方偷偷
+绕过去。预设那一半不需要特殊处理：`.agent-presets/` 是桌面端与 CLI 共享的产品数据，插件首次激活时落盘。
+
+兼容性有一套**声明式**机制，这正是未来新线要满足的东西：dsh 会拿每个插件的
+`peerDependencies["@deepseek-ai/dsh"]` 与运行时版本比对（含预发布版），不覆盖就告警 —— 实现见
+`packages/boot/app-boot/src/plugin-compatibility.ts`，旁边就是测试。我们这个范围**故意**停在 `0.2.0-0` 以下，
+所以 0.2.x 运行时拿到的是那条警告，直到我们适配并重测，而不是一句「大概能用」。
+
+## 31. dsh 0.2.0-rc.1：对一个插件来说到底变了什么（2026-09-28）
+
+`@deepseek-ai/dsh@0.2.0-rc.1` 出现在 npm 的 `next` 标签下（此前共 27 个版本，最新是 `0.1.7-rc.2`），仓库里是
+tag `dsh-v0.2.0-rc.1`。按实际发生的顺序记录：
+
+**1. `npm view` 能看到版本号，并不等于这次发布完成了。** 第一次安装失败，而且不是我们的问题：
+
+```
+$ npm i -g --prefix /root/dsh020 @deepseek-ai/dsh@0.2.0-rc.1
+npm error code ETARGET
+npm error notarget No matching version found for @deepseek-ai/dsh-client-ui-settings-account@0.2.0-rc.1.
+```
+
+注册表里的发布时间：`@deepseek-ai/dsh@0.2.0-rc.1` 是 12:34:03Z，那个依赖是 12:54:22Z。dsh 声明的 79 个
+`@deepseek-ai/*` 依赖里，runtime 落地时只有 74 个已上。第 4 次尝试（几分钟后）干净装好。**新线装不上时先重试，
+再怀疑插件。**
+
+**2. 0.2.0 把兼容性告警升级成了安装闸门。** 我们的插件（1.9.18，范围停在 `0.2.0-0` 以下）被直接拒绝：
+
+```
+$ DSH_HOME=/root/dsh-020 ./install.sh
+dsh: installation rejected: Plugin dsh-custom-mode@1.9.18 is incompatible with dsh 0.2.0-rc.1:
+peerDependencies {"@deepseek-ai/dsh":">=0.1.5-rc.2 <0.2.0-0 || ..."}. Running it may cause crashes or data
+loss. Update the plugin or install a plugin version compatible with this dsh runtime. ...
+Exact-version exemption: not active.
+```
+
+整个机制就这一条：声明的 `peerDependencies["@deepseek-ai/dsh"]` 范围就是那个开关 —— 「支持一条线」 与 「声明这个范围」 是同一件事。现在范围末尾是 `|| >=0.2.0-0 <0.3.0-0`。
+
+**3. 放宽范围之后：安装、启动、套件、选择器、页面 —— 0.2.0 上全绿。**
+
+```
+$ DSH_HOME=/root/dsh-020 ./install.sh            # 装进 web profile
+$ DSH_HOME=/root/dsh-020 dsh --profile web --dump-config | grep -c dsh-custom-mode
+2
+
+$ grep custom-mode /root/dsh-lab/dsh020-lab.log
+custom-mode: backend=declarative · 有: list,register,inventory,select,document · 无: remove,copy,read ...
+                                    ← 与 0.1.7 完全一致
+
+$ node test/run.mjs                                # 宿主 = 0.2.0-rc.1，夹具由其声明派生
+15 个套件全部通过（801 项）
+
+$ node tools/picker-probe.mjs --url <url> --expect 自定义模式
+选择器里的模式：["Standard mode","PTC mode","Minimal mode","Creator mode","自定义模式"]
+✓ 期望的模式都在：自定义模式
+
+$ node tools/browser-verify.mjs --url <url> --out /root/verify020.png
+结果: 65 通过, 0 失败        ← 含官方度量断言（14px/22px w500 标题、12px/18px tertiary 引言、
+                               扁平行 + 1px 分隔线、[role=switch]）
+```
+
+**4. 桌面端形状不变。** 在 0.2.0-rc.1 这个 tag 上，`apps/desktop/package.json` 是 `@deepseek-ai/dsh-desktop`
+版本 `0.2.0-rc.1`（private，故以签名安装包发布），README 仍然写着同样三件事：Electron 独占
+`$DSH_HOME/profiles/desktop`、CLI 不能修改它、插件改动走共享的 Web 插件管理器。所以 1.9.18 的桌面端结论
+原样成立 —— 在应用内的 Plugins 页安装。
+
+**5. 有一条实测不是任何一方的 bug，但值得记下。** seed 套件那条 P0 检查（「派生组成里每一条启用的行都能在本机安装里解析」）失败过一次，列出 23 行。原因在这台机器的布局：`unresolvableRows()` 探测的是 `@deepseek-ai/dsh-agent-presets` 解析到的那棵树，而当时它指向仓库里那份夹具副本，不是被测宿主。把宿主按 CI 的方式装进仓库（`npm install --no-save @deepseek-ai/dsh@0.2.0-rc.1`）之后，同一条检查通过。写下来是因为这个失败看起来像产品 bug，其实不是。
+
+## 32. 1.10.0：干净 home 上的 dsh 0.2.0-rc.2，以及仓库根变成发布包（2026-09-30）
+
+**1. npm 一键安装这条主路，在 rc.2 上真装了一遍。** 一次性 `DSH_HOME`，`dsh` = 0.2.0-rc.2：
+
+```
+$ export DSH_HOME=/tmp/dsh-rc2-verify; mkdir -p "$DSH_HOME"
+$ dsh plugin --profile web list
+dsh: initialized profile web at /tmp/dsh-rc2-verify/profiles/web
+$ systemd-run --unit=rc2-official --collect --wait --pipe -p MemoryMax=1000M \
+    --setenv=DSH_HOME=/tmp/dsh-rc2-verify dsh plugin --profile web add dsh-custom-mode
+dependencies:
++ dsh-custom-mode ^1.9.19
+Done in 242ms using pnpm v12.4.2          ← 瞬态 unit 实跑 640ms，内存峰值 44.1M
+$ dsh --profile web --dump-config | grep -c '^- id: '
+184
+$ dsh --profile web --dump-config | grep -A1 'dsh-custom-mode'
+# == dsh-custom-mode
+  name: dsh-custom-mode
+```
+
+**2. 还真启动了一次 —— 播种与注册都发生了。**
+
+```
+custom-mode: 已播种 preset 到 /tmp/dsh-rc2-verify/.agent-presets/custom（新建 5 个文件: agent.cordis.yml,
+  preset.yml, prompt.md, prompt-reader.mjs, prompt-tool.mjs）
+custom-mode: backend=declarative · 有: list,register,inventory,select,document · 无: remove,copy,read
+custom-mode: 已注入 95 个出厂行模块名（compositionInventory）
+custom-mode: 已取回 4 个基础模式的出厂组成（standard、ptc、minimal、cordis）
+custom-mode: 声明式注册表同步完成 —— 目标 1 个助手，成功 1 个（custom）
+```
+
+也就是说 0.2.0-rc.2 上的安装、组合、播种、注册与 0.2.0-rc.1 逐步一致：**不需要改代码**，因为声明范围
+本来就覆盖 `>=0.2.0-0 <0.3.0-0`。1.10.0 在这件事上的动作是"验证 + 把 CI 钉子挪过去"。
+
+**3. GitHub 地址安装这条老路仍然可用 —— 而这正是重点。** 同一条命令换成
+`github:BOWLUNA/dsh-custom-mode`（读仓库根清单）照样成功：
+
+```
++ dsh-custom-mode github:BOWLUNA/dsh-custom-mode
+Done in 1.8s using pnpm v12.4.2
+```
+
+1.10.0 之前它也能装（`private: true` 不会让 pnpm 拒绝），但它读的清单**不是** npm 发布的那一份 ——
+这恰恰是目录站显示 `#editor`、dshfind 报"尚未发布到 npm"的原因。
+
+**4. 发布包本身没有变。** 在仓库根跑 `npm pack --dry-run`：
+
+```
+LICENSE, README.i18n.yaml, README.md, README.zh.md, assistants.mjs, atomic.mjs, base-composition.mjs,
+client.js, composition.mjs, cordis.patch.yml, index.mjs, journal.mjs, locales.mjs, meta.mjs, package.json,
+paths.mjs, preset-backend/declarative.mjs, preset-backend/detect.mjs, preset-backend/index.mjs,
+preset-backend/parse-composition.mjs, preset/agent.cordis.yml, preset/preset.yml, preset/prompt-reader.mjs,
+preset/prompt-tool.mjs, preset/prompt.md, seed.mjs
+total files 26 size 149kB
+```
+
+与 1.9.19 的 tarball 对照，运行时文件完全相同（而 `editor/preset/` 本来就和 `preset/` 逐字节一致），
+所以用户装到的东西没变；多出来的只有 npm 自动包含的 `README*`，因为仓库 README 现在就是 npm 落地页。
+
+**5. 守门。** `node test/run.mjs` → 15 套件 / **805 项**（manifests 套件按"单一清单"重写；seed 套件
+从"两份预设逐字节一致"改成"包内预设**就是** `preset/`"）。`verify-doc-numbers`、
+`verify-translation-pairing`、`verify-version-consistency --dsh 0.2.0-rc.2` 与 `--dsh 0.1.7-rc.2`、
+两个脚本的 `bash -n` 全过。
+
+> 本节之前的各节里出现的 `editor/...` 路径，是 **1.10.0 之前**布局的实测记录，按原样保留；
+> 1.10.0 起包就在仓库根，对应路径去掉 `editor/` 前缀即可（`client.js`、`index.mjs`、`preset/`、
+> `package.json`）。
+
+
+## 33. 1.11.0：第五个基础模式是并集 —— 而这份并集会发出一份 broken 的预设（2026-10-01）
+
+**1. 缺口，数出来的。** `renderComposition(modeId, overrides)` 改的是**基础模式出厂文本**里那些行的
+`disabled:`，所以那份文本里没有的行，开关**根本碰不到**。在 `0.2.0-rc.2` 上逐份数出厂组成：
+
+```
+standard  32 行
+ptc       33
+cordis    33
+minimal    7
+并集      40     ← 新模式
+```
+
+于是选「标准模式」时有 8 行拨不到：`tool-presentation`（只有 PTC 有）、`persistent-shell` 整组 ——
+`pty`、`terminal-bash`、`persistent-bash`、`terminal-pwsh`、`persistent-pwsh`（只有极简有）——
+以及 `tool-cordis`（只有创造有）。
+
+**2. 并集是坏的，而任何单元测试都看不见。** 把并集组成真的写进
+`.agent-presets/custom/agent.cordis.yml` 并真启动宿主，再问实例自己的 API：
+
+```
+$ curl -s -b "$JAR" …/api/custom-mode
+{"ok":true,"assistants":[{"id":"custom",…,
+  "broken":"persistent-bash (@deepseek-ai/dsh-tool-bash-persistent):
+            tool \"bash\" is already registered in this scope"}]}
+```
+
+broken 的预设会从**所有**选择器里被丢掉 —— 而设置页自己的信号全是绿的（`ok:true`、`warnings:[]`、
+`unresolvable:[]`）。这正是本仓发出过两次的那种 P0 形态，而它对 828 项全过的检查完全隐形。
+
+根因：极简的 `persistent-shell` 那一套和标准的 `tool-bash` / `tool-pwsh` 是同一件东西的两种实现 ——
+都注册一个叫 `bash` 的工具。极简里不冲突，只是因为它**没有**标准那两行。
+
+**3. 到底哪些行相撞，量出来的。** 六个变体，逐个写盘再真启动，读 `broken`：
+
+| 组成 | `broken` |
+| --- | --- |
+| 并集原样 | ✗ `persistent-bash` / `tool-bash` |
+| 并集，关掉 `persistent-shell` | ✓ null |
+| 并集，关掉 `tool-bash` + `tool-pwsh` | ✓ null |
+| 并集，两侧都关 | ✓ null |
+| 并集，不要 `persistent-shell` 那一组 | ✓ null |
+| 并集，不要 `tool-presentation` / `tool-cordis` | ✗ 仍然 broken ⇒ 那两个是清白的 |
+
+两条结论都实测过：**被禁用的行不参与碰撞**（所以那一组可以被带进并集、也可以被开关）；冲突恰好就是
+两套壳。
+
+**4. 出厂默认不能是"照搬源模式的出厂状态"。** `persistent-shell` 在极简模式里是**启用**的 —— 极简的
+全部内容就是它。所以照搬每行的出厂状态合出来的并集，默认就是**非法**的：`POST /state` 发
+`mode: all` + `overrides: {}`，回答 `code: saved`，而 roster 立刻就是 `broken`（不需要重启）。
+
+修法：`composition.mjs` 的 `EXCLUSIVE_ROW_SETS`，并集在**合成时**就把非偏好的一侧关掉，于是默认组成合法。
+
+**5. 用户仍然能把它弄坏，所以保存路径替他解决。** 打开 `persistent-shell` 而标准壳还开着，是那一组
+**主要**的用法，不是边角情况。既然 `broken` 是**活着**可见的，`saveState` 现在会调
+`applyRowExclusivity()`，并如实报出它动了什么：
+
+```
+$ POST /state {mode: all, overrides: {persistent-shell: true}}
+    ok=true  code=savedWithExclusiveRows  rows="tool-bash"
+    磁盘: tool-bash=off  persistent-shell=on  mode=all
+    broken = null
+```
+
+页面**之外**写进去的冲突组成（手工编辑、别的工具、直接调 API）则由既有的告警通道点名
+（`exclusiveRowsActive`）。
+
+**6. 两条支持线上都做了端到端。** 同一个脚本、两台实验台（`0.2.0-rc.2` 与 `0.1.7-rc.2`），各四步 ——
+切到 `all`、拨互斥的另一侧、拨回来、读页面状态：
+
+```
+modes=["standard","ptc","minimal","cordis","all"]
+warnings=[]   unresolvable=[]   stderr 0 字节
+每一步 broken = null
+```
+
+`tools/boot-check.mjs` 在两条线上都是 A/B/C/D 全过（端口 32010 与 32013）。
+
+**7. 门禁。** `node test/run.mjs` → 15 套件 / **850 项**（原 805）。11 个变异都在副本上跑过，每个都在
+本该抓它的那条断言上变红：
+
+| 变异 | 红在哪 |
+| --- | --- |
+| 并集对读不到的源静默跳过 | `并集在残缺目录里是类型化失败` |
+| 并集去掉顶层去重 | `并集里没有重复行 id` · `并集顶层没有重复 id` · `all: 开关可反推` |
+| `UNION_MODE_ID` 改回 `custom` | `并集模式的 id 不与任何出厂模式重名` · 路由测试 · `base.custom.label` |
+| 并集退化成只有标准 | `并集覆盖四个出厂模式的每一行` · `并集确实比单独选 standard 多出行来` |
+| 并集不再关掉互斥的另一侧 | `并集默认在每一组互斥里只留一侧启用` |
+| 互斥表写了出厂里不存在的行 id | `互斥表里的行 id 都真的存在于出厂组成里` |
+| 清空 `unionDefaultOff` | `并集默认在每一组互斥里只留一侧启用` |
+| `applyRowExclusivity` 原样返回开关 | 两个套件里共 8 条断言 |
+| `saveState` 不再报 `savedWithExclusiveRows` | `用专门的 code 说明动过开关` |
+| `configWarnings` 不再点出互斥 | `页面外写进去的互斥组合会被点名` |
+| 给本来就关着的行也写 `false` | `只动本来就启用着的行` |
+
+**8. 新代码与测试自身暴露的三个缺陷**，留在这里是因为形状本身可复用：
+
+- `composition.mjs` 用 `export { … } from …` **再导出** `BaseCompositionUnavailableError` —— 那只建立
+  导出、**不建立本地绑定**。`unionCompositionText()` 抛它时拿到的是 `ReferenceError`，
+  页面会答 **500 而不是降级**。被新加的子进程断言在第一次运行时抓住。
+- 那条断言最初读子进程的 **stdout**；写管道是异步的而子进程立刻退出，所以每次只拿到第一行。现在它把
+  判决写**文件** —— 静默丢源那个变体下，失败详情里能看见 `"standard=ok\nunion=ok"`。
+- 变异 M7（清空 `unionDefaultOff`）**保持绿色**："列出来的行都被关掉了"对空集合**恒真**。
+  已改写成"每一组互斥里**恰好一侧**启用"——它对上游偏好哪一侧不敏感，但两侧同开一定红。
+
+## 34. 1.11.1：官方桌面端，真跑了一遍 —— 以及那个"页面说没事、预设却一直坏着"的死局（2026-10-01）
+
+**1. 跑的是什么。** `C:\Users\BOWLUNA\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe`，
+FileVersion `0.2.0-rc.2`，Electron 152。它的 `DSH_HOME` 是 `~/.dsh`，profile 是 `desktop`
+（`dsh-profile-desktop`，bundles 为 `dsh-base` + `dsh-web-app` + 四个实验性的）。Electron 的 userData 在
+`%APPDATA%\@deepseek-ai\dsh-desktop`；宿主监听的是**动态端口**（这次是 19387），不是
+`%LOCALAPPDATA%\dsh\dsh-url.txt` 里那个 3080（那个文件是 09-25 的，已经过期）。
+
+两个环境陷阱，都实测过：
+
+- `resources/runtime/cli/bin/dsh.cmd` **故意设 `ELECTRON_RUN_AS_NODE=1`** —— 桌面端是把 Agent Host 当
+  Electron 二进制的 Node 子进程跑的。所以从一个已经带着 `ELECTRON_RUN_AS_NODE=1` 的 shell 里启动它
+  （WorkBuddy 的子进程就带着），Electron 会退化成纯 Node，**窗口根本不出现**。启动前必须清掉。
+- 用 CLI 跑 `dsh --profile desktop` 会被拒绝：**"profile \"desktop\" is managed exclusively by the
+  Electron application"**。这个 profile 只能由应用自己启动，所以它没有 `--dump-config` 可用，
+  插件的 stdout 只能在应用内部读。
+
+**2. 装是装得上的，而且自己播种。** 用应用**自带的**捆绑 CLI 跑
+`dsh plugin --profile desktop add dsh-custom-mode@1.11.0` → `+ dsh-custom-mode 1.11.0`，
+应用的插件页显示 `已安装 1 · dsh-custom-mode`，组件 `custom-mode` **运行中**。
+插件之外什么都不用做 —— 与 §33 在 npm / GitHub 两条路上验过的"一键 = 自给自足"是同一条性质。
+
+**3. 模式还是没出现，而第一次修复让它更糟。** 模式选择器只列了四个出厂模式。在应用内部取（同源，不需要 token）：
+
+```
+GET /api/custom-mode
+{"assistants":[
+  {"id":"custom","broken":"workflow-worker-thread (@deepseek-ai/dsh-workflow-worker-thread): never started"},
+  {"id":"writing-assistant","broken":"workflow-worker-thread (@deepseek-ai/dsh-workflow-worker-thread): never started"}]}
+```
+
+broken 的预设会被从选择器里丢掉。插件自己的检查已经抓到一半 ——
+`warnings: ["unresolvableRows"]`、`unresolvable: [{"id":"workflow-worker-thread", …}]` ——
+所以设置页给了**「按本线修复」**，点下去把那行关掉了。然后：
+
+```
+GET /api/custom-mode      → 两个助手**仍然** broken
+    "tool-workflow (@deepseek-ai/dsh-tool-workflow): waiting for workflowEngine
+     tool-ralph (@deepseek-ai/dsh-tool-ralph): waiting for workflowEngine"
+GET /api/custom-mode/state?id=custom
+    warnings: []        ← 页面现在说一切正常
+    unresolvable: []    ← 我们自己的检查也同意
+```
+
+关掉引擎之后，**等它**的两个工具起不来了。`unresolvableRows()` 答的是"模块装没装"，
+答不了"它需要的服务起没起"。于是页面转绿、模式照旧不出现，而**界面上没有任何办法把它救回来** ——
+这个死局只有桌面端这条线才会踩到（网页线上装了那个引擎）。
+
+**4. 两个修复。** `brokenRowIds()` 解析宿主自己给的诊断 —— 形如 `<rowId> (<module>): <reason>` 的行 ——
+于是 `readState` 在"宿主报 broken、而我们自己的检查解释不了它点到的每一行"时抛出 `presetBroken`。
+`POST /repair` 除了那些无法解析的行，也把宿主点名的行一并关掉，所以反复点击会收敛，而不是卡死。
+
+**5. 第三个修复在页面上。** 「按本线修复」按钮原先只为 `unresolvableRows` 渲染。第一轮修完之后那条告警没了，
+于是页面叫用户去点一个**已经不在屏幕上**的按钮 —— 正是这条告警本来要防的那种死局。现在 `presetBroken`
+也会渲染它。
+
+**6. 在真应用上做了端到端。** 装进 `desktop` profile → 重启 → 账号菜单 → 设置 → 自定义模式 →
+点**一次**「按本线修复」→ 再重启：
+
+```
+GET /api/custom-mode → custom: OK        （第二个助手仍是 broken，它有自己的一行引擎）
+模式选择器 → ["标准模式…", "PTC 模式…", "极简模式…", "创造模式…", "自定义模式 完整编码能力…"]
+```
+
+选择器是在**应用启动时**重读注册表的，所以修好之后要靠一次重启才看得见 —— 这点要说明白，
+因为网页线不需要重启。
+
+**7. 截图。** 五张全部重拍，每张恰好 **800x800**：`01` 现在能看到五个基础模式药丸
+（Standard / PTC / Minimal / Cordis / Custom），`04` 里列着 Custom mode。`04` 是唯一一张有真实构图问题的：
+它沿用了公用的固定 `PANEL` 框，而选择器浮层挂在**垂直居中**的 composer 上，于是 800 行里约 320 行是纯背景。
+现在它把视口加高，并**按弹层自身的矩形**取一个 800x800 的框。实测：弹层 `324x468` @ y=569 → 框 y=400。
+
+**8. 门禁。** 15 套件 / **861 项**（原 850）。另有三个变异，每个都在本该抓它的断言上变红：
+
+| 变异 | 红在哪 |
+| --- | --- |
+| `brokenRowIds` 永远返回 `[]` | `brokenRowIds 抠出行 id` · `宿主点名的行被修复关掉` · `磁盘上真的关掉了` |
+| 修复重新忽略宿主点名的行 | `宿主点名的行被修复关掉` · `磁盘上真的关掉了` |
+| `readState` 不再抛 `presetBroken` | `宿主报 broken 且我们自己解释不了 → 点名 presetBroken` |
+
+## 35. 1.11.2：设置页，对着原生 UI 量着改（2026-10-01）
+
+针对 1.11.1 收到四条反馈（都是真桌面端的截图）。每一条都先**量原生**再动手 —— 桌面端当时正开着 CDP，
+所以对照来自同一个窗口、同一套主题、同一个视口。
+
+**1. 字号档位。** 原生插件页的卡片标题是 **14px/20px、字重 500**，原生设置导航项是 **14px/22px、500**，
+正文/注释是 **12px/18px、tertiary**（`rgb(173,178,184)`）。我们这边同时在用四个字号：`.cpfe-h` 14/22、
+`.cpfe-hint-line` 12/18 tertiary、`.cpfe-note` **11/16 secondary**（`rgb(207,211,214)`）、`.cpfe-desc` 13/20。
+也就是说**同一个角色**（区块下方的说明）有两套字号**和**两种颜色。现在收到原生的两档（14/22 标题、
+12/18 正文），输入保留 13px —— 那是壳自己的输入尺寸。`.cpfe-h` 保持 **22px**、`.cpfe-row-head` 改成
+**20px**：这两个值原生都有，分别对应那两种角色。
+
+**2. 35 与 24 两套间距。** 实测相邻区块的间距是 `35, 35, 24, 24, 24, 24`。原因不是"少写了 margin"，
+而是**继承来的**：`.cpfe-note` 是 `<p>`，UA 样式表给它 `margin-block: 1em`，在 11px 字号下就是 11px。
+所以有说明的区块会比别的多出 11+11 = 22px。改成显式 `margin:0 0 8px` 即可 —— 这也正是**字号与间距必须
+一起改**的原因，只改一个看不出效果。
+
+**3. 行高。** 实测 `.cpfe-row` **76px**、`.cpfe-line` 77px —— 而原生卡片是 **83px 却装着两行描述**。
+内容只有一半，高度却一样。纵向内边距 16px → 12px、标题行高 22 → 20，落到 **66px**。同一轮里还量出两件事：
+
+- 行高在 **66 到 84** 之间浮动，因为 `.cpfe-row-note` 有 `overflow:hidden;text-overflow:ellipsis` 却
+  **没有 `white-space:nowrap`** —— 长说明折成两行就把行撑高。原生页是**省略号**（`…backed by the
+  packaged ripgrep binar…`），所以 `nowrap` 是原生的做法、不是妥协；已有的 `title` 保证截断了也读得到。
+- 加 `nowrap` 之后行高变成 **66 与 67** —— 差 1px。原因是 `.cpfe-tag` 有 0.5px 边框，带徽标的那一行
+  是 19px，不带的是 18px。把 `.cpfe-row-badges` 钉成 `height:18px`，每一行就正好 66px。
+
+**4. 中英拼接的描述。** `preset.yml` 里是一个字符串：
+`完整编码能力，系统提示词来自 prompt.md，可在设置页随时修改、下一步即生效。 / Full coding ability; …`。
+这不是新 bug —— `CHANGELOG` 记着 1.7.0 引入"简短的双语描述"作为英文泄漏回归的修法。它背后的约束是真的：
+描述是**产品数据**，壳能本地化自己的出厂预设，没法本地化我们的。所以模板现在**完全不播描述**
+（空描述是壳支持的状态），并由 `dropShippedDescription()` **只**在我们自己写过的那些字符串**逐字**匹配时
+清掉。随之一并删掉 `noDescription` 告警：默认留空却永久弹 ⚠ 是自相矛盾的，而描述框的占位符本来就写着可留空。
+
+**5. 门禁现在守什么。** 渲染闸门 67 → **70**；新增的两条正是本轮的回归防线：**每一行高度完全一致**、
+**说明行绝不折行**。第三条断言省略号的说明仍带 `title`。原来那条 `行用官方内边距 16px 0` 改成 12px；
+描述那条改成允许为空（**有内容时才不许被截断**）。套件 861 → **869**（描述迁移 8 条新检查：
+两条出厂串被清掉、名字不动、用户自己的文本不动、本来就是空的无操作、文件缺失不抛）。
+
+**6. 五张截图全部重拍** —— `02-plugin-switches.png` 是能看到变化的那张（行高统一的 66px、分隔线均匀），
+`01-mode-switch.png` 能看到五个基础模式药丸与统一后的说明字号。
+
+## 36. 复量原生度量：两条既有断言被证伪，随之修掉三个缺陷（2026-10-02）
+
+§35 已经对着原生 UI 量过一轮。本轮**复量**（起因：用户要求「字体、UI 样式、格式都要符合原生」），
+做法是在**两条支持线上各起一台干净实例**，把官方设置页与我们的页面放进**同一个浏览器**里逐元素读
+`getComputedStyle` + `getBoundingClientRect`。两侧读数一致。
+
+### 1. 原始读数
+
+```
+官方 `_row`（设置行）      padding 16px/0/16px/0 · border-bottom 1px solid · radius 0 · 带描述时 h 77px
+官方 `_title`（行标题）    font-size 14px · line-height 22px · font-weight 400
+官方 `groupTitle`（分组）  font-size 14px · line-height 22px · font-weight 400
+官方 `_selector`（下拉）   h 36px · radius 12px · bg var(--dsw-alias-bg-module-platform) ·
+                          padding 0 14px · font-size 14px · line-height 22px · gap 12px · 文字在前
+官方 `input`（内置插件）   h 36px · radius 12px
+官方 `cardTitle`（卡片）   font-size 14px · line-height 20px · font-weight 500
+官方 `cardDescription`     font-size 12px · line-height 18px · white-space normal · h 36px（两行）
+```
+
+### 2. 两条断言被证伪
+
+**① 「区块标题 14px/22px w500」→ 官方是 w400。** `AGENTS.md` #13、§29、§35 都写着 w500。
+在两个版本上各量一次，官方的 `_title` 与 `groupTitle` **都是 400**；官方唯一的 14px w500 是插件
+**卡片**标题（行高 20px，形态不同），页级标题则是 16px/24px w500。已改成 400。
+
+**② 「行内边距 12px」→ 官方设置行是 16px。** §35 当年**有意**把它从 16px 改成 12px，理由是把行高从 76px
+压到 66px（"原生卡片 83px 却装两行描述"）。但那个比较对象是**卡片**（`cardContent` padding 12px 14px），
+而我们的行是**设置行**形态（1px 分隔线、左标题右控件）。更要紧的是：§35 里"行高在 66–84 之间浮动"的
+**根因**是 `.cpfe-row-note` 缺 `white-space:nowrap`，而它已在同一轮被单独修掉 ——
+降 padding 治的是已经不存在的病。改回 16px 后，带描述的行是 **77px**，与官方设置行**同高**。
+
+### 3. 由此修掉的三个缺陷
+
+- **告警区没有任何 CSS。** `.cpfe-warns` / `.cpfe-warn-row` / `.cpfe-warn` 三个类在样式表里
+  **零规则**（逐表遍历返回 `[]`），所有告警此前都是一串没有排版的裸 `<p>`。已补 12px/18px、
+  `gap 6px`、壳的 `IconWarningOutlineRegular` 14×14，并与首行文字顶部对齐（实测偏移 2px）。
+- **下拉不是官方形态。** 用的是壳 Button 的 `ghost` + `size:"sm"`（28px / 透明底 / 12px 字 / radius 8px），
+  且 chevron 落在文字**前**。官方是 36px / radius-md / 灰底 / 14px 字 / chevron 在**后**。
+  已照官方度量自绘（`.cpfe-selector`）—— 做法与官方一致：官方各设置页也是**各自定义** `_selector`
+  （四个页面四份、度量完全一致），壳的 Button 并没有这一种变体。
+- **输入框圆角不统一。** input / desc / editor 分别是 8px / 10px / 10px，官方无论选择器还是输入框都用
+  `--dsw-radius-md`(12px)。已统一。
+
+### 4. 术语、文案与门禁
+
+- **`cordis` 模式在官方叫「创造模式」（英文 `Creator mode`）。** 实测 `dsh-client-ui-agent-preset`
+  的词典：`presetCordisName: "创造模式"` / `"Creator mode"`（两版同名）。本仓此前把药丸写成
+  「Cordis 模式」、而同一份词典的 `base.all.note` 又写「创造模式」—— 同一个模式在一页里有两个名字。
+  英文侧四个名字（Standard / PTC / Minimal / Cordis）此前都缺官方的 " mode" 后缀，一并补齐。
+- 删掉三个**死词条**（`assistant.meta`、`aria.expandHint`、`aria.collapseHint`）：它们只出现在词典里，
+  从未被任何调用点引用（`aria.*Hint` 是已移除的"折叠引言"的遗留）。
+- `SectionHint` 的五个调用点此前都多传 `id` / `expanded` / `onToggleExpand` / `t` —— 四个它**不读**的 prop。
+- 一条**不准确的表述**：`rows.hint` 的英文版说行列表 "laid out like the official plugin list"，
+  而实测官方插件页是**2 列卡片网格**（`grid-template-columns: 274.5px 274.5px`）、描述**两行可换行**，
+  与我们的单列分隔线列表不是一回事。该从句已删。
+- 渲染闸门 **70 → 74**，新增四条：下拉的官方形态、chevron 在文字之后、**告警区在样式表里有规则**、
+  行标题 14px/22px。两条被证伪的断言改到实测值。两条线各跑一次：
+  `0.2.0-rc.2` 与 `0.1.7-rc.2` 均 **74 通过 / 0 失败**。

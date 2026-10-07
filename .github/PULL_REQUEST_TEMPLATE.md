@@ -1,0 +1,33 @@
+<!--
+The easiest way to break this repository is not "failing to write something", it is writing something
+that silently breaks something else: an untouched row losing its platform condition, a group switch
+landing on a child row, one language updated and the other left behind, one copy of a string changed
+while its twin in another file stays stale, a new row added without a dictionary entry.
+The checklist below exists for exactly those failure modes.
+-->
+
+## What this PR does
+
+<!-- One or two sentences. If it fixes a bug, paste the reproduction command and the before/after output. -->
+
+## Self-check
+
+- [ ] `node test/run.mjs` is green, and `node tools/verify-doc-numbers.mjs` agrees with the docs (it runs the suite itself — do not paste a suite count by hand)
+- [ ] Changed a string in `client.js` → also changed `locales.mjs` (section 6 catches drift)
+- [ ] Changed anything about the private route in `index.mjs` → it is still registered through
+      `ctx.connection.fetch.register(...)` on the fenced `/api` channel (never the raw `webServer` table), and
+      `test/editor-route.test.mjs` still passes
+- [ ] Changed the text surgery in `composition.mjs` → untouched rows are still byte-identical to the shipped ones (including `!!js` conditions and rows that ship disabled)
+- [ ] Added a composition row → `ROW_META` in `composition.mjs` and `row.<id>.label` in `locales.mjs` both cover it (otherwise the row renders as a bare id)
+- [ ] Documentation has no contradicting statements (for example whether editing `client.js` needs a restart) and no stale paths
+- [ ] Screenshots no longer match the UI → re-capture with `tools/screenshots/` instead of editing the images by hand
+- [ ] Both sides of every translation pair were updated, then `node tools/verify-translation-pairing.mjs --write`
+
+## Compatibility
+
+- [ ] No new dsh-internal API is introduced; **if one is**, it was added to the coupling-point table in the README (that table exists so an upgrade can be checked off)
+- [ ] `package.json`'s `version` is bumped (it is the package's own stable line, not the dsh version)
+
+## Notes
+
+<!-- Trade-offs a reviewer should know about, known gaps, and follow-ups. -->

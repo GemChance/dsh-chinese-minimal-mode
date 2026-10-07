@@ -1,0 +1,2069 @@
+# Measurement Log
+
+English | [中文](MEASUREMENTS.zh.md)
+
+> The file name is English (`MEASUREMENTS.md`) because this is the default document and it matches the other files under `docs/`; the Chinese twin is `MEASUREMENTS.zh.md`.
+
+This document records **results obtained by running things on a real machine**, not design notes. Every entry gives the command and the output at the time, so it can be re-run and checked.
+Environment: dsh `0.1.6-alpha.1`, Node 24.21.0, WSL2 (mirrored networking mode), a fresh `DSH_HOME`
+(the instance in use on the development machine is not touched).
+
+For how to re-run, see the commands in each section; `$REPO` means this repository, `$H` means a separate `DSH_HOME`.
+
+---
+
+## 0. End to end: edit the prompt → **it takes effect on the very next step** (real session, two turns)
+
+The whole project rests on this one sentence, and until now it had only a unit test that "the read function is re-evaluated", with no
+end-to-end evidence that "the agent loop really calls it on every step". That is what this section supplies.
+
+**Why a "marker" is used instead of asking the model to recite the system prompt**: asking the model directly to recite the system prompt is refused
+(measured: `我不能复述系统提示词的内容` —— this is reasonable safety behaviour, not a bug). So instead a **format rule** is
+planted in the prompt, and whether the model's actual behaviour follows the file is observed:
+
+```
+【格式规则，每次回答都必须遵守】
+你的每一条回答，第一行必须正好是下面这一串字符，前后不留任何其他字符：
+
+MARK-ONE
+```
+
+**Procedure**: open a session in a real running web instance and ask one question → after the answer, **without restarting, refreshing, or creating a new session**,
+change only `MARK-ONE` in `prompt.md` to `MARK-TWO`, then ask a second question **in the same session**.
+
+**Measured result** (same browser page, same session):
+
+```
+第 1 轮：1+1 等于几？   →  MARK-ONE  2          （用量 8.1K tok）
+（把 prompt.md 改成 MARK-TWO）
+第 2 轮：2+2 等于几？   →  MARK-TWO  4          （用量 9.3K tok）
+```
+
+Verdict:
+
+```json
+{
+ "turn1_hasMarkOne": true,
+ "turn2_hasMarkTwo": true,
+ "turn2_stillOnlyMarkOne": false,
+ "finalPromptMarker": "MARK-TWO"
+}
+```
+
+In other words: **editing the file → the next model call uses the new text** holds; no restart is needed, and no new session is needed.
+(The unit tests for `prompt-reader.mjs` also prove that in the steady state the disk is not re-read repeatedly: one `stat` plus a size comparison.)
+
+Between the two turns, a line "**系统提示词更新**" appears in the interface —— that is marked by dsh itself, showing that it detected the system prompt changing mid-session.
+
+The idea behind the driving script is given below: first use CDP to choose the workspace and type the question into the composer, then poll the page text until the marker appears.
+
+> **One path that does not work, noted here so it is not tried again**: `dsh --profile headless` (the one-shot CLI) **cannot** be used to test this.
+> It explicitly refuses to run a session with an agent preset, and the source says:
+> `session "…" runs under agent preset "…", which the one-shot runner does not compose`.
+> So end-to-end testing can only be done with a web instance.
+
+### 0.1 Incidentally verified: `agent-presets.default` is a runtime setting, not a value in the composition
+
+```sh
+DSH_HOME=$H dsh --profile web --dump-config | grep -A3 'id: agent-presets'
+#   config:
+#     default: standard          ← 组合里写死的默认值
+```
+
+Whereas `agent-presets: { default: custom }` in `$H/settings.yaml` overrides it at runtime (the mode
+selector on the home page then shows "自定义模式"). These two places are not the same thing, and they are easy to confuse when investigating "why hasn't the default mode changed".
+
+---
+
+## 1. Installing into a fresh environment: the pitfall hit with an old `install.sh`
+
+```sh
+rm -rf "$H" && mkdir -p "$H"
+cp ~/.dsh/.credentials.yaml "$H/"          # 只要能启动就行，不涉及模型调用
+DSH_HOME="$H" ./install.sh                  # ← 修复前的版本
+```
+
+Output before the fix:
+
+```
+==> 2/2 安装设置页插件 "dsh-custom-mode" 到 profile "web"
+    已移除解析不到的残留条目: ["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app"]
+    bundle 已登记: ["dsh-custom-mode"]
+安装完成。          ← 退出码 0，用户看不出任何异常
+```
+
+The bundles in `$H/profiles/web/package.json` go from
+`["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app"]` to `["dsh-custom-mode"]`,
+and therefore:
+
+```sh
+DSH_HOME="$H" dsh --profile web --dump-config
+# == dsh-custom-mode
+- id: custom-mode
+  name: dsh-custom-mode
+# ↑ 全文就这两行（正常是 158 行）
+
+DSH_HOME="$H" dsh web --port 3081 --no-open
+# dsh: warning: 1 entry did not activate
+# custom-mode (dsh-custom-mode): pending (waiting for services: webServer, agentPresets)
+# ↑ 服务永远等不到：没有界面、没有 agent
+```
+
+**Trigger conditions** (two orders measured):
+
+| Order | Result |
+| --- | --- |
+| Fresh `DSH_HOME` → `./install.sh` directly | **hit** |
+| Fresh `DSH_HOME` → start `dsh web` once first → `./install.sh` | not hit: starting populates the harness dependencies into `profiles/node_modules`, so the old detection path matches |
+
+After the fix (`==> 3/3 安装后自检`):
+
+```
+    安装前 bundles: []
+    bundle 已登记: ["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app","dsh-custom-mode"]
+==> 3/3 安装后自检（组合 profile）
+    组合树 158 行，dsh-custom-mode 已就位
+```
+
+The guard itself was verified as well: manually change the profile back to its post-bug state and run it, and it exits non-zero:
+
+```
+    自检失败: 组合树只有 1 行，基础 bundle 疑似丢失（正常应有上百行）。
+    当前 bundles: ["dsh-custom-mode"]
+    自救: 把 profile 模板自带的 bundle 名（如 @deepseek-ai/dsh-base、
+          @deepseek-ai/dsh-web-app）加回上面这个列表，见 docs/TROUBLESHOOTING.md。
+```
+
+---
+
+## 2. Unauthorized reads and writes on the settings-page route (security)
+
+Before the fix (the instance runs on 3081):
+
+```sh
+curl http://127.0.0.1:3081/custom-mode
+# → 200 {"ok":true,…,"prompt":"You are a coding agent powered by {{model}} model.…"}
+
+curl -X POST http://127.0.0.1:3081/custom-mode \
+     -H 'content-type: text/plain' \
+     --data '{"mode":"standard","overrides":{},"prompt":"PWNED-BY-UNAUTHENTICATED-POST\n"}'
+# → 200 {"ok":true,"mode":"standard","note":"已保存（基础模式：standard）…"}
+head -1 "$H/.agent-presets/custom/prompt.md"
+# PWNED-BY-UNAUTHENTICATED-POST          ← 文件真的被改了
+
+curl -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3081/
+# 401
+curl -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3081/api/settings
+# 401
+```
+
+After the fix:
+
+| Request | Result |
+| --- | --- |
+| Unauthorized GET | `401 unauthorized` |
+| Unauthorized POST (`text/plain`) | `401`, the file is not rewritten |
+| POST + `Origin: https://evil.example` + `Sec-Fetch-Site: cross-site` | `403 forbidden` |
+| With a valid `dsh-auth-*` cookie (browser session) | `200`, functionality as before |
+
+Re-run:
+
+```sh
+# 未授权
+curl -s -o /dev/null -w 'GET  %{http_code}\n' "http://127.0.0.1:3081/custom-mode"
+curl -s -o /dev/null -w 'POST %{http_code}\n' -X POST "http://127.0.0.1:3081/custom-mode" \
+  -H 'content-type: text/plain' --data '{"mode":"standard","overrides":{},"prompt":"x"}'
+# 有会话（token 从 dsh web 的日志里取）
+curl -s -c /tmp/cj -o /dev/null "http://127.0.0.1:3081/?token=$TOKEN"
+curl -s -b /tmp/cj -o /dev/null -w 'AUTH %{http_code}\n' "http://127.0.0.1:3081/custom-mode"
+```
+
+---
+
+## 3. Feature chain: toggle a switch → save → the actual result on disk
+
+Toggle "网页检索与抓取" off on the settings page and click save, and the page status bar returns:
+
+```
+已保存（基础模式：standard）。新建会话即生效，当前会话保持原配置。
+```
+
+On disk (`$H/.agent-presets/custom/agent.cordis.yml`):
+
+```yaml
+# 本文件由「自定义模式」设置页生成，请勿手工编辑——下次保存会覆盖。
+# 基础模式: standard
+# 生成时间: 2026-09-17T10:03:12.800Z
+…
+- id: tool-web                    # ← 被显式关闭的行
+  name: '@deepseek-ai/dsh-tool-web'
+  disabled: true
+…
+- id: tool-bash                   # ← 没碰过的行，平台条件逐字节保留
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled: !!js process.platform === 'win32'
+```
+
+Two things are proved at the same time: the explicit toggle takes effect; and **untouched rows keep their factory state** (this is the core of the project's correctness,
+and it is also what the 63 checks in `composition.test.mjs` guard against).
+
+Another place on the page shows immediately that the platform expressions really are evaluated on the host side: on Linux, `Shell（pwsh）` shows
+"已停用 / 跟随平台", while `Shell（bash）` shows "已启用 / 跟随平台" —— both carry a
+`!!js` condition in the YAML.
+
+---
+
+## 4. Hot-update contract: edit the file → the next evaluation is the new text
+
+The end-to-end demonstration in a real session requires model calls; the equivalent evidence that does not depend on a model drives `prompt-reader.mjs` directly:
+fetch the persona section's `text` provider the way the registry does and call it.
+
+```sh
+node test/prompt-reader.test.mjs
+```
+
+```
+PASS  prefix 的 text 是函数（每步重新求值）
+PASS  改文件后下一次求值读到新文本（无需重启）
+PASS  未变化时不重新读盘（删除后仍给出缓存文本）
+PASS  被清空后仍给出上一版内容
+PASS  complete: true 时不再注册 suffix
+结果: 15 通过, 0 失败
+```
+
+---
+
+## 5. Bilingual and dark/light
+
+Rather than "reading the code and thinking it should be fine", the controls **of the interface itself** were used to switch, and the result checked with screenshots:
+
+| Action | Observed result |
+| --- | --- |
+| Language → English | The navigation item automatically becomes `Custom mode`; the section titles become `Mode name` / `Base mode` / `Plugin switches` / `System prompt` |
+| Appearance → Dark | The whole page follows (including cards, badges, input fields), with no hard-coded colour values |
+
+These two no longer each come with an image (duplicate images are not worth making the reader download several hundred KB more): the switching was **really
+performed**, and the assertions and observed values are written in `tools/screenshots/observed.json`; the capture script is in `tools/screenshots/`.
+
+---
+
+## 6. Tests and CI
+
+```sh
+node test/run.mjs
+```
+
+```
+出厂 preset 目录: …/dsh-agent-presets/presets
+（来源：$DSH_HOME/profiles/node_modules）
+结果: 63 通过, 0 失败      ← 组成文件编译器
+结果: 15 通过, 0 失败      ← 热更新契约
+结果: 65 通过, 0 失败      ← 词典（含 client.js 手抄副本的漂移检查）
+7 个套件全部通过
+```
+
+The resolution chain was verified under both layouts:
+
+| Layout | Source matched |
+| --- | --- |
+| dsh installed locally | `$DSH_HOME/profiles/node_modules` |
+| `npm install @deepseek-ai/dsh@0.1.6-alpha.1` in a clean directory (what CI does) | Node resolution from this file |
+
+CI uses the presets shipped with the dsh on npm, which are byte-for-byte identical to the local ones (`diff -rq` reports no differences), so CI's conclusions are
+real conclusions, not ones produced by running against a self-made fixture.
+
+---
+
+## 7. Installing into a non-web profile: what works and what does not (measured)
+
+`install.sh --help` and both READMEs mention `--profile tui`, but **measurement** requires distinguishing two levels:
+
+| profile | whether the composition has `agent-presets` | whether the composition has `webServer` | Result |
+| --- | --- | --- | --- |
+| `web` | yes | yes | mode selectable + settings page available (full functionality) |
+| `tui` | **no** | **no** | the mode **cannot be selected**; the settings page does not exist either |
+| `headless` | no (and it would still be refused even if added, see §0) | no | the same as above |
+
+`agent-presets` appears only in the web composition (`dsh --profile web --dump-config | grep agent-presets` has output,
+tui/headless are both 0 lines), and the "自定义模式" preset is exactly what it mounts —— **so in tui it is not that "the settings page
+cannot see it", but that the mode does not exist at all**.
+
+Before the fix, every tui start printed this line (identical to the "installing dsh bricks it" error in §1, purely misleading):
+
+```
+dsh: warning: 1 entry did not activate
+custom-mode (dsh-custom-mode): pending (waiting for services: webServer, agentPresets)
+```
+
+After the fix it is no longer pending (the plugin was changed to wait for services within a scope), and `install.sh` also **explains each profile separately** ——
+deliberately not phrased as "the mode itself is still usable", because on tui that sentence does not hold:
+
+```
+    注意: profile "tui" 里这个插件只有一部分能生效。
+          · 组合里没有 agent-presets：**「自定义模式」无法被选中**，
+            preset 文件被复制过去了，但没有任何东西会挂载它
+          · custom_prompt 工具可用（会话里直接说「把系统提示词改成……」）
+          · 没有设置页：组合里没有 web 服务器
+          要用完整功能（模式可选 + 图形化设置页），请装进 web profile：
+            ./install.sh --profile web
+```
+
+On the web profile the same self-check prints no hint at all (measured occurrence count 0), and the closing note is given as usual:
+"新会话选「自定义模式」".
+
+---
+
+## 8. Uninstall round trip: `uninstall.sh` used to leave a symlink behind
+
+```sh
+DSH_HOME=$H ./install.sh >/dev/null          # 装上
+DSH_HOME=$H ./uninstall.sh                   # 卸掉
+ls "$H/profiles/web/node_modules" | grep custom
+# 修复前：dsh-custom-mode      ← 仍在（指向仓库的软链）
+# 修复后：（无输出）
+```
+
+At the time, `dependencies` in `package.json` and `dsh.profile.bundles` were both already cleaned up; only the
+symlink left by pnpm remained (reproduced on pnpm 12.4.2). It does not affect dsh assembly (assembly only looks at bundles), but uninstall should leave no
+trace —— especially since deleting the repository afterwards turns it into a broken link. Now only this one package name is deleted.
+
+The complete state after uninstall (measured):
+
+```
+bundles:      ["@deepseek-ai/dsh-base","@deepseek-ai/dsh-web-app"]   ← 回到模板原样
+dependencies: undefined                                              ← 清空
+preset 目录:  保留（提示词也保留，符合默认行为）
+组合树:       157 行（= 装上时的 158 行减去本插件那一行）
+```
+
+The idempotence of a second install was verified as well: install → manually edit `prompt.md` → install again; the script keeps the user prompt and
+only updates the mode file (`检测到已存在的 prompt.md，保留它（只更新模式文件）`).
+
+---
+
+## 9. Marketplace install: seeding a fresh `DSH_HOME`
+
+A storefront install is one command, so the package has to be enough on its own. Measured on a fresh
+`DSH_HOME` (only credentials copied), installing the packed tarball and booting:
+
+```
+$ DSH_HOME=$H dsh plugin --profile web add dsh-custom-mode-0.1.6-alpha.1.rev1.tgz
++ dsh-custom-mode file:/tmp/dsh-custom-mode-0.1.6-alpha.1.rev1.tgz
+
+$ ls $H/.agent-presets/custom        # before boot: nothing, seeding happens on activation
+  (absent)
+
+$ DSH_HOME=$H dsh web --port 3082 --no-open
+custom-mode: 已播种 preset 到 …/.agent-presets/custom（新建 5 个文件: agent.cordis.yml, preset.yml,
+prompt.md, prompt-reader.mjs, prompt-tool.mjs）
+dsh web: http://127.0.0.1:3082/?token=…
+```
+
+The mode is then selectable in the new-session picker (read with the same CDP driver the screenshots
+use — the list contained `Standard mode / PTC mode / Minimal mode / Creator mode / 自定义模式`), and the
+settings page answers with the full state:
+
+```
+GET /custom-mode (session cookie) → 200 {"ok":true,"mode":"standard",…19 rows…}
+GET /custom-mode (no cookie)      → 401
+```
+
+The rest of the acceptance run:
+
+| What | Result |
+| --- | --- |
+| Second boot | no `已播种` line at all — it writes nothing when the preset is complete |
+| A `prompt.md` already present before boot | byte-identical afterwards (`md5` unchanged); the other four files were filled in |
+| Read-only `$DSH_HOME/.agent-presets` | dsh starts normally; log: `preset 播种未完成 —— 无法创建 … EACCES`, and the settings page returns `{"ok":false,"error":"找不到组成文件：…"}` |
+| Rename + switch base mode through the page's own route | `preset.yml` → `name: "My Renamed Mode"`, composition header `# 基础模式: minimal`, row count 19 → 3, prompt rewritten |
+| Full UI pass on the seeded instance | the screenshot driver read the state, toggled a row, saved (`已保存（基础模式：standard）…`), switched language and theme |
+
+## 10. Upgrade check against dsh `0.1.6-alpha.2` — coupling points verified statically
+
+The project's versioning policy says an upstream release is checked against the coupling-point list
+before the version number moves. This is that check for `0.1.6-alpha.2`, and it needed no browser:
+the contracts are declarations, so the tarballs answer them.
+
+**Method.** Download the `0.1.6-alpha.2` tarballs for `dsh-agent-presets`, `dsh-system-prompt`,
+`dsh-client-locale`, `dsh-client-connection`, `dsh-tools`, `dsh-host-webserver`,
+`dsh-client-ui-settings` and `dsh-client-ui-slots`; grep the declarations this project depends on out
+of both that copy and the installed `0.1.6-alpha.1`; compare. Then run the full suite twice — once
+against each version's shipped presets.
+
+### Every coupling point is unchanged
+
+| Coupling point | Where it is declared | Result |
+| --- | --- | --- |
+| `agentPresets.list()` return shape (`trust`, `path`) | `dsh-agent-presets` | unchanged (11 matching declarations) |
+| `systemPrompt.section({ text: fn })` — text as a provider | `dsh-system-prompt` | unchanged |
+| `PromptSection.complete` | `dsh-system-prompt` | unchanged |
+| `locale.register` / `locale.bind` | `dsh-client-locale` | unchanged |
+| `connection.requestRejection` (the fail-closed 503) | `dsh-client-connection` | unchanged |
+| `tools.register(definition: ToolDefinition)` | `dsh-tools` | unchanged |
+| `WebRoute { kind, path, handler }` | `dsh-host-webserver` | unchanged |
+| `settings.section` slot: `kind: list`, `scope: root`, owner props | `dsh-client-ui-settings` | unchanged |
+| `locale:` registration option (supplies the bound `t`) | `dsh-client-ui-slots` | still documented — "present exactly on entries whose registration declares `locale:`" |
+
+### What did change: one new row per mode
+
+`standard`, `ptc` and `cordis` each gained exactly one row — `tool-plugin-manager`
+(`@deepseek-ai/dsh-plugin-manager/tools`); `minimal` is unchanged. **No code change was needed**:
+the compiler reads the shipped composition at runtime, so a regenerated composition picks the row up
+by itself. It only had no display label, which is now supplied in both languages — and
+`composition.test.mjs` now asserts that every shipped row id has a `ROW_META` entry, so the next
+upstream row turns CI red instead of silently rendering a bare id.
+
+### Suite result
+
+```
+DSH_SHIPPED_PRESETS_DIR=<0.1.6-alpha.1 presets> node test/run.mjs   → 8 suites, all pass（当时的套件数；本文件保持历史记录原样）
+DSH_SHIPPED_PRESETS_DIR=<0.1.6-alpha.2 presets> node test/run.mjs   → 8 suites, all pass
+```
+
+### Side finding: `chmod` cannot fake an unwritable directory as root
+
+`test/seed.test.mjs` used `chmod 0o500` on the parent directory to exercise the seeding failure
+path. Measured: **root bypasses permission bits**, so seeding succeeded and three assertions flipped
+to red. They were green on CI (a non-root runner) and red for anyone running the suite as root — a
+test whose outcome depended on who ran it. Blocking the path with a regular file instead fails with
+`ENOTDIR` for every user, and the assertions now mean the same thing everywhere.
+
+---
+
+## 11. Several assistants: create, delete and switch N modes from one settings page (real instance)
+
+Environment as in §9: a fresh `DSH_HOME=/tmp/dsh-dev`, web profile, its own port 3081 — the instance in
+use on this machine was never touched.
+
+### 11.1 Test suites
+
+```
+$ node test/run.mjs
+shipped presets dir: /usr/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-agent-presets/presets
+(from: $DSH_HOME/profiles/node_modules)
+…
+result: 64 passed, 0 failed      composition.test.mjs
+result: 26 passed, 0 failed      composition-edge.test.mjs
+result: 15 passed, 0 failed      prompt-reader.test.mjs
+result: 37 passed, 0 failed      prompt-tool.test.mjs
+result: 45 passed, 0 failed      meta.test.mjs
+result: 56 passed, 0 failed      assistants.test.mjs   ← new in this change
+result: 94 passed, 0 failed      editor-route.test.mjs ← grew from one route to five endpoints
+result: 31 passed, 0 failed      seed.test.mjs
+result: 66 passed, 0 failed      locales.test.mjs
+result: 19 passed, 0 failed      client-bundle.test.mjs ← new (the browser half's registration contract)
+result: 16 passed, 0 failed      manifests.test.mjs
+all 11 suites passed, 469 checks in total
+```
+
+### 11.2 Install and start
+
+```
+$ DSH_HOME=/tmp/dsh-dev ./install.sh
+    composition tree: 164 rows, dsh-custom-mode in place
+$ DSH_HOME=/tmp/dsh-dev dsh web --port 3081 --no-open --host 127.0.0.1
+dsh web: http://127.0.0.1:3081/?token=…
+```
+
+The token is exchanged for a browser-session cookie (`GET /?token=…` → `303` + `set-cookie: dsh-auth-…`);
+every request below carries it.
+
+### 11.3 The fence, then the list
+
+```
+$ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:3081/custom-mode
+401                                          ← unauthenticated (the fence still comes first)
+
+$ curl -s -b "$JAR" http://127.0.0.1:3081/custom-mode
+{"ok":true,"assistants":[{"id":"custom","name":"自定义模式","description":"完整编码能力…"}],
+ "root":"/tmp/dsh-dev/.agent-presets"}
+```
+
+### 11.4 Creating two assistants (one Chinese name, one English)
+
+```
+$ curl -s -b "$JAR" -H 'content-type: application/json' \
+    -d '{"name":"写作助手","description":"负责写文档与博客"}' http://127.0.0.1:3081/custom-mode/create
+{"ok":true,"id":"custom-2","name":"写作助手",…}      ← Chinese slugs to nothing → custom-2
+
+$ curl -s -b "$JAR" -H 'content-type: application/json' \
+    -d '{"name":"Writer"}' http://127.0.0.1:3081/custom-mode/create
+{"ok":true,"id":"writer","name":"Writer",…}          ← an English name becomes the directory name
+
+$ ls -1 /tmp/dsh-dev/.agent-presets/
+custom
+custom-2
+writer
+```
+
+The new directory holds the complete five-file template, with `agent.cordis.yml` regenerated from Standard:
+
+```
+$ head -3 /tmp/dsh-dev/.agent-presets/custom-2/agent.cordis.yml
+# 本文件由「自定义模式」设置页生成，请勿手工编辑——下次保存会覆盖。
+# 助手: 写作助手 (custom-2)
+# 基础模式: minimal
+$ grep -n modeName /tmp/dsh-dev/.agent-presets/custom-2/agent.cordis.yml
+77:    modeName: "写作助手"
+```
+
+### 11.5 Every prompt is independent (the actual claim being verified)
+
+```
+$ curl -s -b "$JAR" -H 'content-type: application/json' \
+    -d '{"id":"custom-2","mode":"minimal","overrides":{"tool-fs":false},
+         "prompt":"你是写作助手，负责把要点写成清晰的文档。\n\n工作目录：{{cwd}}\n",
+         "name":"写作助手","description":"负责写文档与博客"}' \
+    http://127.0.0.1:3081/custom-mode/state
+{"ok":true,"id":"custom-2","mode":"minimal","note":"已保存（写作助手，基础模式 minimal）。…"}
+
+$ head -c 30 /tmp/dsh-dev/.agent-presets/custom/prompt.md   → You are a coding agent pow
+$ head -c 30 /tmp/dsh-dev/.agent-presets/custom-2/prompt.md → 你是写作助手，负责把要点写成清
+$ head -c 30 /tmp/dsh-dev/.agent-presets/writer/prompt.md   → You are a coding agent pow
+```
+
+Validation still guards the write path (a rejected save leaves the file untouched):
+
+```
+$ curl -s -b "$JAR" -H 'content-type: application/json' \
+    -d '{"id":"custom-2","mode":"minimal","prompt":"x {{foo}} y"}' …/custom-mode/state
+{"ok":false,"error":"保存被拒绝：{{foo}} 不是已注册的变量，渲染时会报错并让本模式每个请求都失败。可用：{{model}}、{{cwd}}、{{provider}}。"}
+```
+
+### 11.6 Deletion: shipped presets are refused, your own are not
+
+`remove` goes through `scope.agentPresets.remove(id)`, so "the row really was in the roster" is itself
+proof that the running process had already discovered the new directory:
+
+```
+$ curl … -d '{"id":"standard"}' …/custom-mode/delete
+{"ok":false,"error":"找不到助手「standard」。设置页只管理本工具创建的模式…"}
+
+$ curl … -d '{"id":"writer"}' …/custom-mode/delete
+{"ok":true,"id":"writer","note":"已删除「writer」。正在使用它的会话不受影响；新建会话时不再出现。"}
+$ ls -1 /tmp/dsh-dev/.agent-presets/
+custom
+custom-2
+```
+
+Methods and sub-paths (a GET must not create an assistant):
+
+```
+$ curl -s -o /dev/null -w "%{http_code}\n" -b "$JAR" …/custom-mode/create   → 405
+$ curl -s -b "$JAR" …/custom-mode/nope
+{"ok":false,"error":"未知的子路径：/custom-mode/nope"}
+$ curl … --data-binary @4MB.json …/custom-mode/state                        → 500 (body too large)
+```
+
+### 11.7 The new assistant really is in the mode picker
+
+The picker reads discovery, so ask discovery — against the real instance's `DSH_HOME`:
+
+```
+$ node /tmp/roster-check.mjs
+custom     user    自定义模式        mountable
+custom-2   user    写作助手         mountable      ← not broken: the composition loads and every row resolves
+standard   system  标准模式         mountable
+ptc        system  PTC 模式        mountable
+minimal    system  极简模式         mountable
+cordis     system  创造模式        mountable
+```
+
+The browser half is confirmed new as well (the bundle the page loads is byte-identical to the repo file,
+apart from the appended `sourceMappingURL`):
+
+```
+$ curl -s -b "$JAR" '…/plugins/??dsh-custom-mode/client.js&rev=…' -o /tmp/served-client.js
+http=200 bytes=44361
+$ diff /tmp/served-client.js editor/client.js
+874,875d873
+< ;
+< //# sourceMappingURL=/plugins/??dsh-custom-mode/client.js.map&rev=…
+```
+
+**One thing NOT verified**: no browser was available, so the React output itself (the assistant list and
+button layout) has no screenshot check. Every other link — route, disk, roster, bundle — was exercised
+on a real instance.
+
+---
+
+## 12. Aligning the UI with the shell's atoms (seed table measured) + duplicate (real instance)
+
+### 12.1 The evidence that decides whether this layer is even possible: the seed table
+
+A hand-written bundle can only `require`. So "use the official controls" depends on the shell
+registering them as seed words. Searching `dsh-web-frontend/dist/assets/index-8VXBH-f-.js` (616 KB)
+finds exactly that table:
+
+```
+$ python3 - <<'PY'   # search the dist for dsh-client-ui-primitives and print the context
+...untime":_c,"react-dom":bc,"react-dom/client":Ic,"@deepseek-ai/cordis":ec,
+"@deepseek-ai/dsh-client-store":Jc,"@deepseek-ai/dsh-client-ui-slots":ou,
+"@deepseek-ai/dsh-client-ui-primitives":Cy,"@deepseek-ai/dsh-client-ui-dockkit":Xw}}var ix=class{...
+```
+
+It sits beside `react`, so any bundle can require it, and it needs **no** `dsh.client.external` (that
+field serves *graph rows*, which have their own record in the boot manifest).
+
+### 12.2 How it looks in the boot manifest (an easy misreading)
+
+```
+$ python3 … parse globalThis["__DSH_BOOT__"]
+keys: ['rev', 'entries', 'batches'];  entries: 59
+--- @deepseek-ai/dsh-client-ui-primitives      → (NOT A ROW)
+--- @deepseek-ai/dsh-client-ui-settings-general → {"id":"…settings-general","url":"/plugins/??…&rev=b97a6adea38cd90c-20","inject":[…]}
+--- dsh-custom-mode                             → {"id":"dsh-custom-mode","url":"/plugins/??dsh-custom-mode/client.js&rev=b97a6adea38cd90c-49","rev":"…-49"}
+declared by @deepseek-ai/dsh-client-ui-subagent in inject
+declared by @deepseek-ai/dsh-client-ui-jobs in inject
+```
+
+It is **not an entry**; it appears only in two official bundles' `inject` lists, while the official
+`settings-general` requires it at runtime with no declaration — consistent with the seed table in
+12.1. (Reading only the boot manifest would wrongly suggest a dependency declaration is required.)
+
+### 12.3 Duplicating an assistant (real instance, port 3081)
+
+```
+$ curl … -d '{"id":"custom","mode":"minimal","overrides":{"tool-fs":false},
+              "prompt":"原始提示词 MARK-SOURCE\n","name":"原始助手","description":"被复制的那一个"}' …/custom-mode/state
+{"ok":true,…}
+
+$ curl … -d '{"name":"副本助手","from":"custom"}' …/custom-mode/create
+{"ok":true,"id":"custom-2","name":"副本助手",
+ "note":"已复制出「副本助手」：提示词、基础模式与插件开关都来自「custom」，之后各改各的，互不影响。"}
+
+$ curl … '…/custom-mode/state?id=custom-2'
+{"id":"custom-2","mode":"minimal","overrides":{},"prompt":"原始提示词 MARK-SOURCE\n",
+ "name":"副本助手","description":"被复制的那一个","promptPath":"/tmp/dsh-dev/.agent-presets/custom-2/prompt.md"}
+
+$ grep -c MARK-SOURCE /tmp/dsh-dev/.agent-presets/*/prompt.md
+/tmp/dsh-dev/.agent-presets/custom/prompt.md:1
+/tmp/dsh-dev/.agent-presets/custom-2/prompt.md:1
+```
+
+`overrides` is `{}` rather than `{"tool-fs":false}` because the source is `{}` too — Minimal has no
+`tool-fs` row, so that switch was dropped at write time. The duplicate matches the source field for
+field, which is the property worth asserting.
+
+### 12.4 Cache headers and the rev (whether users must clear their cache)
+
+```
+$ curl -D - … '/plugins/??dsh-custom-mode/client.js&rev=b97a6adea38cd90c-49'
+HTTP/1.1 200 OK
+cache-control: public, max-age=31536000, immutable
+```
+
+`immutable` looks alarming, but the rev is a content hash:
+
+```
+dsh-client-modules/lib/index.js:
+  function artifactRevision(bundle, baseline) {
+    return framedHash("plugin-artifact", [bundle, Buffer.from(String(baseline.mtimeMs))]);
+  }
+  const rev = artifactRevision(readFileSync(record.meta.clientPath), baseline);
+```
+
+Change the file's bytes or mtime and the rev changes, hence the URL. **An ordinary refresh after a
+restart is therefore enough.**
+
+### 12.5 Suites
+
+```
+result: 104 passed, 0 failed     editor-route.test.mjs  ← new: route-constant drift guard, duplicate
+result: 26 passed, 0 failed      client-bundle.test.mjs ← new: atoms present / absent, both paths
+all 11 suites passed            ← 486 checks in total
+```
+
+---
+
+## 13. A whole page of raw keys caused by the `settings.section` contract, plus ordering measured live
+
+### 13.1 The authoritative contract (not an inference)
+
+The slot declaration ships inside `dsh-cordis-client-runner`, `registerOptions` and documentation included:
+
+```
+$ python3 - <<'PY'   # extract the settings.section declaration from dsh-cordis-client-runner/lib/client.js
+{
+  key: "settings.section", kind: "list", scope: "root",
+  registerOptions: [
+    { name: "id",    requirement: "required", type: "string" },
+    { name: "order", requirement: "optional", type: "number" },
+    { name: "label", requirement: "optional", type: "string | (() => string)" }
+  ],
+  ownerProps: […SettingsSectionOwnerProps…],
+  standardProps: ["useResource: UseResource", "useWorkspaces: …", …]
+}
+```
+
+**`locale:` is not among them.** The old code relied on it to receive the shell's bound `t`, so the body
+echoed keys.
+
+### 13.2 Boot manifest: this bundle is installed exactly once (ruling out a repeated apply)
+
+```
+$ parse globalThis["__DSH_BOOT__"]
+entries: 59
+occurrences of dsh-custom-mode: 1
+its manifest row: [{"id":"dsh-custom-mode","url":"/plugins/??dsh-custom-mode/client.js&rev=e159d1f9c23eee42-49","rev":"e159d1f9c23eee42-49"}]
+is ui-primitives an entry: False        ← it is a seed word, not a graph row
+```
+
+So "registered twice / applied twice" does not hold in this version; with the contract change above, the
+raw keys are fully explained.
+
+### 13.3 The fixed artifact and its dictionary content
+
+```
+$ curl -s '…/plugins/??dsh-custom-mode/client.js&rev=e159d1f9c23eee42-49' -o /tmp/s3.js
+http=200 bytes=70019
+$ node -e "…count the inlined dictionaries…"
+served ZH entries: 127
+contains "nav": true
+contains "assistant.heading": true
+```
+
+The floor dictionaries do ship, and they carry the nav and page keys.
+
+### 13.4 Ordering (real instance, port 3081)
+
+```
+$ create Alpha / Beta / Gamma
+ created alpha Alpha / created beta Beta / created gamma Gamma
+
+$ curl … /custom-mode            → alpha:Alpha | beta:Beta | custom:自定义模式 | gamma:Gamma
+$ curl … -d '{"id":"beta","direction":"up"}' …/custom-mode/reorder
+{"ok":true,"id":"beta","order":["beta","alpha","custom","gamma"],
+ "note":"顺序已保存：新建会话时的模式选择器按这个顺序排列。"}
+$ curl … /custom-mode            → beta:Beta | alpha:Alpha | custom:自定义模式 | gamma:Gamma
+
+$ for d in custom alpha beta gamma; do grep ^order: /tmp/dsh-dev/.agent-presets/$d/preset.yml; done
+custom   order: 3
+alpha    order: 2
+beta     order: 1
+gamma    order: 4
+
+$ curl … -d '{"id":"beta","direction":"up"}' …/custom-mode/reorder
+{"ok":false,"error":"「Beta」已经在最前面。"}
+$ curl … -d '{"id":"custom","direction":"sideways"}' …/custom-mode/reorder
+{"ok":false,"error":"未知的排序方向：sideways"}
+$ curl -o /dev/null -w '%{http_code}' …/custom-mode/reorder     (GET)
+405
+```
+
+The order lands in `preset.yml` rather than in plugin state, so it survives a restart; `GET` cannot change it.
+
+### 13.5 The client bundle is still content-addressed
+
+```
+cache-control: public, max-age=31536000, immutable
+rev = artifactRevision(readFileSync(clientPath), { mtimeMs })
+```
+
+Change the file and the rev — hence the URL — changes. **An ordinary refresh after a restart is enough**;
+no cache clearing.
+
+---
+
+## 14. Browser verification (lab, dsh `0.1.6-alpha.2`)
+
+This is the first time the project has **seen** the page it renders. The machine running the harness
+is the **host** and can never be a test target — restarting it kills the running session. So
+verification happens on a lab machine you can reboot freely. `$LAB` below is that machine (its address
+and launcher scripts live in the operator's own `~/.dsh/AGENTS.md`); a generic recipe that needs only
+"a second machine and a browser" is in the repository `AGENTS.md` §"The lab".
+
+### 14.1 Lab preparation (including the dsh upgrade)
+
+```
+$ ssh "$LAB" 'dsh --version'
+0.1.6-alpha.1
+$ ssh "$LAB" 'npm i -g @deepseek-ai/dsh@0.1.6-alpha.2'      # run it in the background
+$ ssh "$LAB" 'dsh --version'
+0.1.6-alpha.2
+```
+
+The npm tags are a trap: `latest` is the stale `0.1.5-rc.2` while new builds sit on `alpha`; and the
+upgrade is slow (Tencent mirror), so it belongs in the background with polling, never a foreground ssh.
+
+```
+# isolated DSH_HOME + a settings.yaml that suppresses the first-run modals (onboarding/locale/theme
+# only — credentials never leave the session machine)
+$ ssh "$LAB" 'cd /root/dsh-lab/dsh-custom-mode && DSH_HOME=/root/dsh-custom-lab ./install.sh'
+    composition tree: 164 rows, dsh-custom-mode in place
+$ ssh "$LAB" '/root/custom-lab.sh'
+dsh web: http://127.0.0.1:3082/?token=SaOzofZ2…
+```
+
+Browser: the lab already carries playwright's chromium
+(`/root/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome`); `/root/chrome-lab.sh` starts it
+with `--headless=new --remote-debugging-port=9222`.
+
+```
+$ ssh "$LAB" '/root/chrome-lab.sh'
+{"Browser": "Chrome/153.0.8010.12", "Protocol-Version": "1.3", …}
+```
+
+### 14.2 Result: 21/21
+
+```
+$ ssh "$LAB" 'cd /root/dsh-lab/dsh-custom-mode && CDP_PORT=9222 \
+    node tools/browser-verify.mjs --url "http://127.0.0.1:3082/?token=…" --out /root/custom-mode-verify.png'
+
+PASS  first-run overlay cleared (otherwise every click below is intercepted)
+PASS  the 「自定义模式」 settings page opens
+PASS  no raw translation keys in the panel
+PASS  rendered the 「助手」 section heading
+PASS  rendered the 「新增助手」 button
+PASS  rendered the 「上移」 button
+PASS  rendered the 「下移」 button
+PASS  rendered the 「复制一份」 button
+PASS  rendered the 「导出提示词」 button
+PASS  rendered the 「导入提示词」 button
+PASS  rendered the system-prompt section
+PASS  rendered the base-mode section
+PASS  rendered the plugin-switch section
+PASS  every switch has a visible row title
+PASS  the left nav entry is not the raw key nav
+PASS  the new assistant appears in the list
+PASS  the delete risk-confirmation opens
+PASS  the confirmation has an acknowledgement checkbox
+PASS  「永久删除」 clicked
+PASS  the assistant is gone from the list
+PASS  no dsh-custom-mode error in the page console
+
+result: 21 passed, 0 failed
+```
+
+The screenshot was copied back and inspected **by eye**: the nav reads 「自定义模式」; the 「助手」
+section has the hint text, the pill, the full-width create field and 「+ 新增助手」; 「模式名称」 has two
+full-width inputs; the action row shows 「上移 / 下移 / 复制一份 / 删除这个助手」 (move buttons correctly
+disabled with a single assistant); 「基础模式」 shows four pills plus the note line; 「插件开关」 shows two
+cards whose switches have **visible titles** (「身份（系统提示词）」, 「custom_prompt 工具」). Zero raw keys.
+
+### 14.3 Two traps the verifier itself hit (both fixed)
+
+- The settings panel is itself `[role=dialog]`, so `querySelector('[role=dialog]')` returned the
+  **panel**, not the confirmation — the assertion failed, the checkbox got ticked, and the confirm
+  button was never clicked (the screenshot captured exactly that intermediate state). It now searches
+  **all** dialogs by content.
+- `RiskConfirmation`'s confirm button reads React state, so ticking and clicking must happen in **two
+  ticks**, or the delete never fires.
+
+## 15. Re-verification on dsh `0.1.6-alpha.2`, installed from npm
+
+Everything below was run against a throwaway `DSH_HOME` and the package **as published**, not the
+working tree: the tarball was first compared with `npm pack` of the repository and found byte-identical
+(16 files, same list hash).
+
+### The install path, and the detour it took
+
+```
+$ dsh plugin --profile web add dsh-custom-mode
++ dsh-custom-mode 0.1.6-alpha.1            ← the registry said `latest` = 0.1.6-alpha.2
+
+$ node -p "require('$DSH_HOME/profiles/web/package.json').dependencies"
+{ 'dsh-custom-mode': '0.1.6-alpha.1' }
+```
+
+That is pnpm's one-day supply-chain delay, not a registry problem: `minimumReleaseAge` defaults to
+`1440` minutes in pnpm ≥ 11, alpha.2 was 13 hours old, alpha.1 was 24.3. Installing the exact version
+works and records the exception:
+
+```
+$ dsh plugin --profile web add dsh-custom-mode@0.1.6-alpha.2
+$ node -p "…dependencies"                 → { 'dsh-custom-mode': '0.1.6-alpha.2' }
+```
+
+The symptom on the older version is visible and is exactly what the seeding work removed: no
+`custom-mode: 已播种` line, no `$DSH_HOME/.agent-presets/`, and the settings route answering
+`{"ok":false,"error":"找不到组成文件：…"}`.
+
+### On the published alpha.2
+
+```
+custom-mode: 已播种 preset 到 …/.agent-presets/custom（新建 5 个文件: agent.cordis.yml, preset.yml,
+             prompt.md, prompt-reader.mjs, prompt-tool.mjs）
+GET /custom-mode          → 200 {"ok":true,"assistants":[{"id":"custom","name":"自定义模式",…}],"root":…}
+GET /custom-mode (no cookie) → 401
+```
+
+`tools/browser-verify.mjs` against it: **21 通过, 0 失败** — the page opens, no raw translation keys,
+the assistant block and its buttons render, the three blocks render, every switch has a visible row
+title, create puts an assistant in the list, delete opens the risk confirmation, confirming removes it,
+and the page logs no `dsh-custom-mode` error.
+
+### Several assistants (the new capability), checked on disk
+
+| Step | Result |
+| --- | --- |
+| `POST /custom-mode/create {"name":"writer"}` | id `writer` — an English name becomes the directory name |
+| `POST /custom-mode/create {"name":"写作助手"}` | id `custom-2` — anything that is not a legal id falls back |
+| Each assistant's directory | `agent.cordis.yml`, `preset.yml`, `prompt.md`, `prompt-reader.mjs`, `prompt-tool.mjs` |
+| Prompt written to `writer`, then to `custom-2` | `writer/prompt.md` = `WRITER-PROMPT-V2`, `custom-2/prompt.md` = `CUSTOM2-PROMPT`, `custom/prompt.md` untouched |
+| Base mode per assistant | `writer` → `# 基础模式: standard`, `custom-2` → `# 基础模式: minimal` |
+| A hand-authored preset (`handmade/`: no `prompt.md`, composition does not use `prompt-reader.mjs`) | not listed, a save for it is refused with a readable error, and its files are byte-identical afterwards |
+| `POST /custom-mode/delete {"id":"writer"}` | directory removed, list back to two |
+| Restart dsh | the deleted assistant does **not** come back; the other two keep their own prompts; `handmade/` is still untouched |
+
+### Two tooling bugs this run surfaced
+
+- `tools/screenshots/screenshots.mjs` still looked for the old controls: the switches are the shell's
+  own atoms now (`[role=switch]` with `aria-checked`; measured 32 rows, 32 switches, **0**
+  `input[type=checkbox]`), and the save control is a plain `button`, not `.cpfe-btn`. Both lookups were
+  rewritten, which is what makes the four README images regenerable again.
+- `tools/screenshots/run-shots.sh` resolved its output directory **after** changing into
+  `tools/screenshots/`, so a relative `docs/images` was created inside the tool directory instead of the
+  repository. It now resolves the path before the `cd`; verified by re-running with the relative
+  argument and watching the images land in `docs/images/`.
+
+---
+
+---
+
+## 16. The HTTP surface moved onto the platform's fenced channel (0.1.6-alpha.2, throwaway instance)
+
+An external review pointed out that this plugin registered its routes on the bare `ctx.webServer` table and
+called `ctx.connection.requestRejection` itself, while the platform ships a fenced alternative. Verified, and
+`1.0.3` completed the migration.
+
+### 16.1 Probe first: measure what `/api` really does instead of inferring it from the types
+
+A 20-line probe plugin (three `/api` routes, `methods`/`requestBody` copied from how the official packages
+register) installed into a throwaway `DSH_HOME` (port 3094):
+
+```text
+GET  /api/rev-probe                   unauthenticated           → 401 unauthorized
+GET  /api/rev-probe                   session cookie            → 200 {"probe":"get-ok",...}
+GET  /api/rev-probe?x=1&y=2           session (query visible)   → {"probe":"get-ok","query":"?x=1&y=2",...}
+POST /api/rev-probe-post              unauthenticated           → 401
+POST /api/rev-probe-post              session + JSON body       → 200 {"probe":"post-ok","got":{"a":1}}
+POST /api/rev-probe-post              session + bad JSON        → 400 (the message our own handler returned)
+GET  /api/rev-probe   session + Origin: https://evil.example + Sec-Fetch-Site: cross-site → 403
+GET  /api/rev-probe   Host: evil.example                         → 403
+POST /api/rev-probe   (that route declares GET only)             → 404 (the handler is never reached)
+GET  /api/rev-probe/nope   an unregistered sub-path              → 404
+GET  /rev-probe            (the old bare-route shape)            → 404
+```
+
+**Two facts that are easy to get wrong**: the registered `path` must **include the `/api` prefix** (the
+official packages pass `/api/present.host`, `/api/changes.summary`; the types' "below /api" describes the URL
+space — a first attempt with `/rev-probe` got 404s); and a method a route does not declare is **never
+dispatched**, so it yields 404 rather than 405.
+
+### 16.2 After the migration (`/api/custom-mode*`, port 3095)
+
+```text
+GET  /api/custom-mode                    unauthenticated         → 401 unauthorized
+POST /api/custom-mode/state              unauthenticated (JSON)  → 401, prompt.md md5 unchanged
+GET  /api/custom-mode                    session cookie          → 200 {"ok":true,"assistants":[…]}
+GET  /api/custom-mode                    session + cross-site Origin → 403
+GET  /api/custom-mode                    Host: evil.example      → 403
+GET  /custom-mode                        (the old bare route)    → 404
+POST /api/custom-mode/state              session cookie          → 200 saved; prompt.md and composition written
+```
+
+The browser half (real browser over CDP): `tools/browser-verify.mjs` **21 passed / 0 failed** — the
+create/delete round trip, the risk-confirmation dialog and the language/theme switches all work on the new
+paths.
+
+Structural assertions on the code (`test/editor-route.test.mjs`): all five exact paths are registered on
+`connection.fetch` with `requestBody: 'buffered'`; `create`/`delete`/`reorder` declare POST only; the source
+contains **no** `requestRejection(` call and **no** `webServer.register(`; and when `connection` never
+arrives, **nothing is registered at all**.
+
+---
+
+## 17. In-session prompt rewrites go through the platform's approval seam (0.1.6-alpha.2, real sessions)
+
+The requirement: `custom_prompt`'s `write` replaces the whole system prompt, and the caller can be an injected
+model — that path had no gate at all. The fix registers `tools/pre-execute` (a waterfall) and answers
+`{kind:'ask'}` for the write action, leaving the outcome to the platform's approval policy.
+
+### 17.1 Probe first: do not infer the behaviour from a type comment
+
+A 20-line probe plugin (registers the listener only, answers `ask`) driven through a real session on a
+throwaway instance:
+
+```text
+[ask-probe] tools/pre-execute listener registered
+$ in the session: use the custom_prompt tool to set the system prompt to 审批测试第一版. One tool call only.
+# permission preset = danger-full-access (approval: never):
+工具调用Error: the user rejected tool "custom_prompt"          ← no panel; treated as a denial
+思考The user rejected the tool call. I should stop and explain.
+(prompt.md unchanged)
+
+# permission preset = workspace-write (approval: ask):
+工具调用 custom_prompt · write
+等待审批
+ask-probe：改系统提示词前需要你确认          ← the reason we passed is shown verbatim
+[拒绝] [允许一次]
+# after clicking 「允许一次」:
+已生效：系统提示词已改为 审批实测通过。
+(on disk: /…/.agent-presets/custom/prompt.md now contains 审批实测通过)
+```
+
+**Two conclusions**: whether `ask` shows a panel is decided by the **approval policy** (`never` → no panel,
+straight denial; `ask` → the panel), so the worst case for this gate is "the change does not happen", never
+"it happened quietly".
+
+### 17.2 Re-checked with our own gate in place
+
+```text
+panel text: 等待审批
+            把「自定义模式」的系统提示词整体替换为 7 字符：审批实测通过。（写入 /tmp/…/prompt.md）
+            [拒绝] [允许一次]
+click 「允许一次」 → the tool runs and the file becomes 审批实测通过 (the agent also reported where it wrote and what it affected)
+click 「拒绝」     → prompt.md md5 unchanged (fb6bdc8c…), the file was not touched
+```
+
+The browser verification (`tools/browser-verify.mjs`) covers the settings-page side separately; this chain
+needs a real session, which is why it is recorded here.
+
+The sequence above was read by hand from the trajectory tab; `tools/session-trace.mjs` (added after this run)
+turns the same evidence into one command — `node tools/session-trace.mjs --home <that home> [--summary]` — and
+prints the per-tool tally that shows, for example, whether an agent needed one call or two.
+
+---
+
+## 18. Model-in-the-loop deep test (0.1.6-alpha.2, test-account token, throwaway instance)
+
+Real model sessions (`DeepSeek-V4.1-Flash`) were used to check the contracts that **only a real session can
+check**. Conclusions and non-conclusions are kept apart.
+
+### 18.1 Verified
+
+1. **All three paths of the approval gate** (raw output in §17): policy `ask` + allow → the write really
+   happens; `ask` + deny → the file's md5 is unchanged; policy `never` → no panel, straight denial. The worst
+   case is "the change does not happen", never "it happened quietly".
+2. **`{{model}}` is rendered into the host's real model id**: the session described itself as "an encoding
+   agent powered by the `deepseek-flash` model" — the template says `{{model}}` and the host substituted the
+   real id. (This is the field most easily got wrong: the interface's display name is not the real id.)
+3. **An unregistered variable does not kill the session**: with `prompt.md` hand-written to contain `{{nope}}`,
+   the session still answered (1+1 → 2). The settings page refuses to save such text, but a file broken by
+   another path must not take the session down with it.
+4. **Preset attribution of a session**: a new session takes `agent-presets.default` from `settings.yaml`
+   (measured: after setting it to `custom`, a new session's mode is 「自定义模式」); and **a session that has
+   produced content cannot switch presets** (matching the upstream documentation, and the easiest trap in
+   automation: sending into an old session measures a different mode).
+
+### 18.2 The hot-reload contract: **holds** (and my first attempt got it wrong — recorded here)
+
+**Conclusion**: rewriting `prompt.md` inside a session that **has already produced content** takes effect on
+the **next step** — the promise in §0 above, independently reproduced.
+
+The clean experiment (throwaway instance, `0.1.6-alpha.2`, `deepseek-flash`, session mode confirmed to be
+「自定义模式」):
+
+```text
+[turn 1] ask once, while prompt.md has no marker rule
+  ask: 5+5 等于几？
+  reply: 5 + 5 = 10                     ← no marker in the reply (clean baseline)
+
+[write the rule] put a marker format rule into prompt.md (same session, nothing else changed)
+
+[turn 2] ask again in the same session
+  ask: 6+6 等于几？
+  reply: [[MARKER-7F3A]]                ← first line is exactly the marker the rule demands
+         6 + 6 = 12
+  the page also showed the platform's own annotation: **「系统提示词更新」**
+```
+
+**My first "it does not take effect" was a fault in the test design, and it is worth recording**: that run
+went "write the rule, ask once (the reply already contains the marker) → remove the rule, ask again", and the
+later replies still carried the marker. I read that as "the session is frozen on the prompt it mounted with",
+but the real cause was **the model imitating its own earlier replies** (few-shot self-imitation), unrelated to
+whether the system prompt was updated. The lesson: when checking whether a prompt change took effect, **the
+baseline turn must not contain the feature you are about to look for**, otherwise everything you see later may
+be imitation.
+
+This also explains why the `custom_prompt` tool's write must only touch the file and not the session: the
+platform re-reads the system prompt on the next step, so the plugin neither needs nor should poke at session
+state.
+
+---
+
+## 19. From a real session to a check that can fail (0.1.6-alpha.2, real session)
+
+The trace reader existed so that "the model called this tool once / twice" could be verified instead of
+asserted. Closing that loop on reality also found a bug in the reader itself — which is the point of running it
+against real logs rather than only synthetic ones.
+
+```text
+$ node tools/session-trace.mjs --home /tmp/dsh-exp-… --expect 'custom_prompt(read)=1'   # 第一次：假失败
+会话 session-6f22e6f7-…：1 次工具调用
+     1 × custom_prompt
+  ✗ custom_prompt(read)：期望 1，实际 0
+
+# 原因：真实日志里 data.arguments 是 **JSON 字符串**（"{\"action\": \"read\"}"），不是对象。
+# 读取器只认对象 → 静默丢掉 action → 计数键退化成 custom_prompt（合成测试用的是对象，所以没暴露）。
+
+$ node tools/session-trace.mjs --home /tmp/dsh-exp-… --expect 'custom_prompt(read)=1'   # 修好之后
+会话 session-6f22e6f7-…：1 次工具调用
+     1 × custom_prompt(read)
+  ✓ 1 条期望都成立        （退出码 0；写错成 =2 时退出码 1）
+
+$ node tools/session-trace.mjs --home /tmp/dsh-exp-…
+工具调用（按时间）：
+  t1/s1  custom_prompt {"action":"read"}
+```
+
+`--compare <A> <B>` 是同一件事的横向版本：两边各读一次，输出按 |Δ| 排序的差值表（例如换实现后
+"总调用数 +0，custom_prompt(append) 1 → 1"）。
+
+---
+
+## 20. The mode disappeared from every picker on the stable line (reported by a review, confirmed, fixed)
+
+**Symptom**: on `0.1.5-rc.2` (the npm `latest` line, i.e. most users' default), 「自定义模式」 did not appear in the
+new-session mode picker at all. The settings page still opened and worked.
+
+**Root cause, reproduced here**:
+
+```text
+$ grep -n -A2 "workflow-ptc" editor/preset/agent.cordis.yml     # our packaged seed template
+    - id: workflow-ptc
+      name: '@deepseek-ai/dsh-workflow-ptc'
+
+$ ls /tmp/dsh-stable3/node_modules/@deepseek-ai/ | grep -c workflow-ptc
+0                                                                # the stable line does not ship that package
+$ grep -c workflow-ptc <preview>/presets/standard/agent.cordis.yml
+2                                                                # the preview line does
+```
+
+An enabled row whose plugin cannot be resolved makes the platform's health check mark the whole preset broken,
+and a broken preset is dropped from the pickers — silently, since the settings page never needs the preset to be
+resolvable. Our packag seed template had been rendered from the **preview** line, so it carried that row.
+
+**Why the double-line CI missed it** (the review's point, and it is correct): the stable job ran the suite, which
+checks text surgery, routes and dictionaries — none of which ask "is this preset healthy on this line"; the UI
+verification only ever ran against the preview line and only against the settings page, never the picker.
+
+**Fix**: the seeded composition is no longer a copy of a packaged file — it is rendered from the composition the
+**installed line actually ships** (`starterComposition()` in `editor/seed.mjs`), with the packaged file kept only
+as a fallback when that cannot be read. `install.sh` no longer copies a composition at all, so the first
+activation writes the derived one. A new check in `test/seed.test.mjs` walks every **enabled** row of the derived
+composition and asserts its package resolves in this install; on the stable line it prints the template's own
+problem, which is the bug it prevents:
+
+```text
+说明：包内模板在本线有 1 处不可解析（workflow-ptc → @deepseek-ai/dsh-workflow-ptc）—— 这正是播种改为"按本线派生"的原因。
+```
+
+**Verified on the stable line** (throwaway `DSH_HOME`, plugin installed from the working tree, port 3108):
+
+```text
+$ ls $DSH_HOME/.agent-presets/custom/
+agent.cordis.yml  preset.yml  prompt-reader.mjs  prompt-tool.mjs  prompt.md
+$ grep -c workflow-ptc $DSH_HOME/.agent-presets/custom/agent.cordis.yml
+0
+$ node tools/picker-probe.mjs <url>           # opens the new-session picker over CDP
+  当前模式按钮: {"text":"自定义模式"}
+  选择器里的模式: ["自定义模式","标准模式","PTC 模式","极简模式"]
+  ✅ 稳定线上「自定义模式」出现在选择器里
+```
+
+---
+
+## 21. The plugin-row list was rebuilt to match the shell's own plugin page (`1.8.0`)
+
+Reported by the user: "the per-row annotation text takes too much room, the spacing is uneven, some of it does not
+even wrap — a long bar just hangs there." Measured before the change (settings page, 1440×1200 viewport, 33 rows):
+
+```text
+rows: 33   widths: 274px (auto-fill grid, 2 columns)   heights: 84–117px (uneven)
+second line: the bare row id (`tool-bash`, `tool-fs-search`, `planning`, …) or a wrapped note
+```
+
+The shell's own Plugins page (sidebar → 插件) uses **one compact row per plugin**: an icon, a title line with tags,
+a single *truncated* description line, and the switch on the right; measured row height 66px, uniform.
+
+After the rebuild (same viewport, same data):
+
+```text
+rows: 33   layout: one per line   heights: 56 and 58px   horizontal overflow: 0
+collapsed second line: the description, one line, ellipsis-truncated (`title` carries the full text)
+```
+
+The disclosure (row id / note / tri-state / platform condition) was checked on the rendered page:
+
+```text
+$ node tools/browser-verify.mjs --url …            # 49 checks now (was 44)
+  PASS  每行都不高于 64px（紧凑、不再是大长条）
+  PASS  行高统一（最高与最低相差 ≤ 8px）
+  PASS  没有行横向溢出（说明文字截断而不是撑破）
+  PASS  每行都有详情开关
+结果: 49 通过, 0 失败
+```
+
+DOM reading of an expanded row (via CDP, the automated *click* is left out of the suite on purpose — in the WSL
+headless lab the coordinate measured for the pointer click occasionally races with a re-render, and a
+flaky assertion is worse than none):
+
+```text
+展开后的详情: "行 id | persona | 说明 | 提示词注入点；关掉后本模式用回部署默认身份 | 开关状态 | 未改动（跟随官方默认）"
+```
+### Same pass, the second half: section copy and the description field
+
+Two more things from the same report — the four sections each opened with a paragraph, and the description field
+clipped its own content:
+
+```text
+before: 助手 / 模式名称 / 基础模式 / 插件开关  →  a paragraph of 60–120 characters above every control
+        description field: single-line input, bilingual text, rendered as "完整编码能力… / Ful"   ← clipped
+after:  each section shows one hint line with a ▸ that opens the full explanation
+        description field is a textarea that grows with its content (measured: scrollHeight <= clientHeight)
+```
+
+The section hints reuse the row list's language (one compact line, detail on demand) and the same expanded-state
+map, so there is one interaction pattern on the page instead of two.
+
+**The browser verification earned its keep here**: all 13 suites passed while the settings page was in fact
+throwing, twice, both from this change —
+
+```text
+[error] slot entry crashed in 'settings.section': ReferenceError: Cannot access 'draft' before initialization
+[error] slot entry crashed in 'settings.section': TypeError: Cannot read properties of null (reading 'description')
+```
+
+The first was a `useEffect` placed above the `draft` it reads; the second read `draft.description` when no
+assistant is selected. Neither is visible to a unit test, and the second is the exact "page silently missing"
+class this repository has shipped before. Four checks were added for the two complaints (one-line hints, hints
+have a toggle, the description is a `TEXTAREA`, the description is not clipped): 49 → **53** checks.
+
+---
+
+## 22. What the review-driven iterations cost (token accounting)
+
+The user reported the client's own counters for the session that turned four external reviews into releases
+`1.4.0` – `1.9.0`:
+
+```text
+uncached input        3,973,904 tok
+cache reads         711,962,624 tok
+output                1,559,791 tok
+```
+
+Arithmetic used in the README's "Built with" section (same formula as the first pass, so the two lines of
+accounting are comparable):
+
+```text
+iteration total     3,973,904 + 711,962,624 + 1,559,791 = 717,496,319 tokens
+iteration hit rate  711,962,624 / (3,973,904 + 711,962,624) = 99.44%
+project total       126,287,613 + 717,496,319 = 843,783,932 tokens
+project hit rate    (125,638,016 + 711,962,624) / (125,862,074 + 715,936,528) = 99.50%
+```
+
+---
+
+## 23. The three-review pass: what was real, what was wrong (1.9.1)
+
+Three independent reviews arrived together. The convergent finding — documentation drift — was real in every
+case, and two of their three status claims about the repository were wrong. Recording both directions, because a
+review is evidence too and this file is where evidence lives.
+
+**Claims checked and refuted**
+
+```text
+claim: "no GitHub Releases (only tags)"
+$ gh release list --limit 20 | head -4
+  v1.9.0 … v1.8.0 … v1.7.1 … v1.7.0 …            ← nine releases, v1.3.0 onwards
+→ wrong; the review read a stale page.
+
+claim: "SECURITY.md lists 1.0.0–1.0.6, but only 1.0.4 exists"
+$ curl -s https://registry.npmjs.org/dsh-custom-mode | …versions…
+  0.1.6-alpha.1, 0.1.6-alpha.1.rev1, 0.1.6-alpha.2, 1.0.0, 1.0.1, 1.0.2, 1.0.3, 1.0.4, 1.1.0 … 1.9.0
+→ the table was wrong about the range (1.0.0–1.0.4) and the review was right that it was wrong; it also
+  flagged the duplicated "current target" rows, which were there.
+
+claim: "concurrent GET /state can interleave/lose a journal record"
+→ refuted for one process: the append is synchronous (`writeFileSync` + `rename`) and Node runs one callback at
+  a time, so two handlers cannot interleave inside it; the atomic rename means a reader never sees a partial
+  file. Cross-process contention on one DSH_HOME is documented as out of scope and is a different claim.
+```
+
+**Confirmed and fixed** (details in the CHANGELOG): the D1–D8 documentation table (CONTRIBUTING's removed
+architecture, the PR template's three stale items, SECURITY's table, the README's `@1.7.0` pin, `test/README.md`'s
+eight-suite/333 transcript), the bilingual description in the picker (a regression from `1.7.0`), row metadata
+claiming a default state that only holds on one dsh line, the base-switch-without-save silence, the
+`content-length`-only body cap, and the journal's third copy of the atomic write.
+
+**Numbers after this pass**
+
+```text
+node test/run.mjs                   13 suites, 667 checks      (was 662)
+tools/browser-verify.mjs            56 checks                  (was 53)
+tools/verify-doc-numbers.mjs        ✓ 13 / 667 / dsh range / version 1.9.1
+tools/verify-translation-pairing.mjs ✓ bilingual pairing + language purity
+```
+
+---
+
+## 24. The third review's P0 ("`REQUEST_EXTENSION` on both lines") — **does not reproduce** (2026-09-19)
+
+That review reported: any custom-mode assistant fails ~2s after any message with
+`DeepSeek request extension preparation failed / REQUEST_EXTENSION`, on **both** the alpha and the stable line, while
+the same instance's official 「标准模式」 replies normally.
+
+Re-checked with one real session per line (throwaway `DSH_HOME` each, plugin either from the working tree or from
+npm as published):
+
+| Line | Host | Plugin | Result |
+| --- | --- | --- | --- |
+| preview | `0.1.6-alpha.2` (global install) | working tree, 1.9.2 | **normal reply** (8.7K tok, 1 turn / 1 step) |
+| stable | `0.1.5-rc.2` (temp prefix) | **npm 1.9.2** (pinned install) | **normal reply** (8.8K tok); seeded composition has **0** `workflow-ptc` rows |
+
+Page tail from the stable run:
+
+```text
+… 用量 8.8K tok / 用时 1秒 / 1 轮 1 步·256 tok/s …
+```
+
+i.e. request **preparation succeeded** — otherwise the extension error would have come first, not a normal reply.
+
+Supporting evidence: the derived seed's row list is **equivalent** to the packaged template's (20 vs 19 rows; the
+extra one is this line's own `tool-plugin-manager`), and the plugin's own resolver check reports **0 unresolvable
+rows** on both lines.
+
+**Conclusion: not reproducible here, on either line.** The review's observation may be environment-specific (an API
+endpoint/credential problem surfacing during preparation, or its 1.9.0 install carrying an older composition file).
+Its host log would settle it — this repository does not treat "we cannot reproduce it" as "it did not happen".
+
+---
+
+## 25. Community directory status (2026-09-19)
+
+Already listed: `awesome-dsh-plugin/awesome-dsh-plugin`, `imsai-sh/awesome-deepseek-harness-plugins`,
+`unStone/dsh-xray`, `anbeime/skill`.
+
+Submitted this round:
+
+```text
+bruc3van/awesome-dsh-plugin#123   SHOWCASE.md「作者自荐」+「Author showcase」各加一行（自动抓取+人工复核的清单）
+beancookie/awesome-dsh-plugin#183 README.md + README.en.md 的「🧑💻 开发与运行时 / Development & Runtime」各加一行
+```
+
+Automatic: `AdamPlatin123/dsh-plugin-radar` documents "carry the `dsh-plugin` topic → auto-discovered within 8h"; the
+repository has had that topic all along, so the entry is a matter of time.
+
+Not pursued: `Alex-Yanggg/awesome-DSH-plugin` (last updated 2026-08-15, dormant) and
+`diegosouzapw/awesome-omni-dsh-plugins` (★17).
+
+
+---
+
+## 26. Second external review round (2026-09-19) — eleven verified, two refuted
+
+Four reviewers ran against the review kit in the operator's engineering-guidelines folder (this repository's
+README/AGENTS/MEASUREMENTS plus a prompt that asks for evidence, guard-coverage columns and a bounded list).
+Unlike the first round, every finding arrived with a command and raw output, and eleven of them reproduced
+here. Fixed in `1.9.3`:
+
+| Severity | Finding | Fix |
+| --- | --- | --- |
+| P1 (security) | Upgrades never refreshed the **code modules** inside a managed assistant directory, so a user who first installed `1.0.x`/`1.1.x` kept an approval-gate-less `prompt-tool.mjs` forever | `prompt-reader.mjs` / `prompt-tool.mjs` are refreshed when they differ (atomic write); `prompt.md`, `preset.yml` and the generated composition stay fill-only |
+| P1 | `install.sh` still copied the packaged composition (rendered from one DSH line) → the other line judges the preset broken and the mode vanishes from the picker | the installer no longer copies it; the plugin derives it per line |
+| P1 (guardrail) | `tools/picker-probe.mjs` looked for `Standard`, while an English UI renders `Standard mode` → the probe could not find the picker at all | the name table carries the real English labels |
+| P1 (guardrail) | `tools/browser-verify.mjs` assumed a Chinese UI: an English cold start produced ~20 opaque failures | it opens Settings, switches the UI to Chinese first, and **exits with a clear message** if it cannot (verified on an English instance: 57 checks, 0 failures) |
+| P2 | "Fix for this line" was not purely in-place: it rewrote the persona segment, dropping comments or duplicating the identity row | only a full re-render replaces that segment (`replacePersona`) |
+| P2 | Seeding used a bare `copyFileSync` → `EBUSY` on Windows when two instances share a `DSH_HOME` | all writes go through the shared atomic helper |
+| P2 | A mode the platform silently drops was only visible in the settings page | the host logs a warning at activation, with row ids and what to do |
+| P2/P3 | English dictionary leaks: CJK brackets, a CJK list separator, literal `**` | cleaned in the `en` object only (the dictionary-drift test keeps the two copies aligned — it caught two of this round's own mistakes) |
+| P3 | `POST /state` cleared a description the request omitted; `publishConfig.tag` was `alpha` | the description is preserved; the tag is `latest` |
+
+Refuted, with evidence: the P1 claim that the mode is listed in the picker but selecting it does nothing (a
+session created after switching carries `agentPreset = custom`, read from the session record rather than the
+UI), and the earlier `REQUEST_EXTENSION` P0 (four more reviewers, six more sessions, still no reproduction).
+
+Kit follow-up: `05-项目已有护栏.md` now has to say that the guardrails themselves have blind spots — the
+English-locale gap was exactly that.
+
+## 27. Adversarial review on a stock `0.1.7-rc.2`: the settings page was a 500 (2026-09-25)
+
+**Setup.** ACUS04 (`ssh acus04`): node 24.21.0, `dsh 0.1.7-rc.2` installed globally, throwaway
+`DSH_HOME=/root/dsh-custom-lab`, throwaway web profile, Chromium 153 (playwright build) over CDP. The tree was
+shipped with `tar --exclude=node_modules --exclude=.git`; the harness on the machine serving the user was never
+touched.
+
+**Before the fix (1.9.12).** Same instance, same tree:
+
+```
+GET  /api/custom-mode            → 200 {"ok":true,"assistants":[{"id":"custom",…}]}
+GET  /api/custom-mode/state?id=custom
+     → 500 {"ok":false,"code":"internalError","params":{"detail":"无法定位出厂基础模式。已尝试：agentPresets 的
+       system 预设路径、Node 解析、profile 的 node_modules。…"}}
+POST /api/custom-mode/state      → 400 {"code":"renderFailed","params":{"detail":"无法定位出厂基础模式…"}}
+POST /api/custom-mode/create     → 400 {"code":"renderFailed","params":{"detail":"无法定位出厂基础模式…"}}
+POST /api/custom-mode/repair     → 200 {"code":"repairNotNeeded"}
+GET  /api/custom-mode/repair     → 404（方法表正确）
+```
+
+`node tools/browser-verify.mjs` → **10 PASS / 7 FAIL**, then it died at `fill(.cpfe-editor) found nothing`
+(the prompt editor never rendered). `node tools/picker-probe.mjs --expect 自定义模式` → **exit 0**: the mode was
+in the picker, which is why the failure was invisible to every check that looks at the picker.
+
+**Root cause, in one line:** the only route to a shipped composition was
+`require.resolve('@deepseek-ai/dsh-agent-presets/package.json')`, and 0.1.7 does not publish that package.
+
+**Proof it is the cause (same instance, one environment variable added).** With
+`DSH_SHIPPED_PRESETS_DIR=<0.1.6-alpha.2 presets dir>`:
+
+```
+GET  /api/custom-mode/state      → 200（rows/modes 全回来）
+POST /api/custom-mode/state      → 200 {"code":"saved"}
+POST /api/custom-mode/create     → 200 {"code":"created"}
+browser-verify                   → 30 PASS / 0 FAIL, then the CDP driver wedged
+                                   (CDP timeout: Input.dispatchMouseEvent — the browser, not the product)
+```
+
+**The route the fix uses.** `agentPresets.readDocument('standard')` on 0.1.7-rc.2 returns:
+
+```
+{ "agentPreset": "standard",
+  "content": "- id: persona\n  name: '@deepseek-ai/dsh-persona'\n  config:\n    suffix: …\n- id: plan…" }
+```
+
+— the declaration as entry-list YAML, `isolate` groups and `!!js` included, i.e. exactly the shape the
+composer edits. `compositionInventory()` cannot be used instead: on the same instance it returns rows flattened
+to `{entryId, moduleName, enabled, condition, fiberState}` (29 rows for `standard`, no groups), which is why
+`parse-composition.mjs` had already ruled it out.
+
+**And why CI never saw it.** `GET /repos/BOWLUNA/dsh-custom-mode/actions/workflows/test.yml/runs` shows the
+1.9.10, 1.9.11 and 1.9.12 pushes **failed**, with job `test (ubuntu-latest, 24, 0.1.7-rc.2)` failing at the step
+`安装 DSH（并准备测试夹具的 presets 目录）` — all three 0.1.7 legs, while `0.1.5-rc.3` and `0.1.6-alpha.2`
+passed. Reproduced in a clean directory:
+
+```
+npm install --no-save @deepseek-ai/dsh@0.1.7-rc.2                  # ok
+npm install --no-save @deepseek-ai/dsh-agent-presets@0.1.6-alpha.2 # npm error code ERESOLVE
+```
+
+Under GitHub's `bash -e` a failed install is a failed step, so those legs never ran a test. `release.yml`
+meanwhile installed only `0.1.6-alpha.2` before publishing, which is how a green release gate and three red
+legs coexisted for three releases.
+
+## 28. The browser gate on 0.1.7-rc.2 — a native dialog behind 27 missing checks (2026-09-25)
+
+Context: 1.9.15. Three findings that only a rendered page can show. All commands run against a throwaway
+`DSH_HOME` on a second machine, dsh `0.1.7-rc.2`, `chrome-headless-shell` with CDP on 9222.
+
+**1. `window.confirm` freezes the renderer, and that is why the gate stopped at 30/57.**
+
+```
+$ CDP_PORT=9222 node tools/browser-verify.mjs --url "http://127.0.0.1:3082/?token=…"
+PASS  新增后在列表里出现
+file…/cdp.mjs:69
+Error: CDP timeout: Input.dispatchMouseEvent
+```
+
+The next call after that PASS is the delete. Probing the frozen page:
+
+```
+[+    1ms] trivial evaluate (before): 2
+[+ 8002ms] delete click: __TIMEOUT__          ← the click handler never returns
+[+ 6001ms] trivial evaluate (after delete click): __TIMEOUT__
+top -bn1 | grep chrome  →  0.0 % CPU          ← blocked, not spinning
+```
+
+Dismissing the dialog over CDP unfroze it immediately, which identifies the cause:
+
+```
+handleJavaScriptDialog 成功? yes
+关掉对话框之后的渲染进程: alive:2
+```
+
+So the page was sitting inside a native `confirm()`, which blocks the renderer synchronously; a headless
+browser has nobody to click it, so every later CDP command timed out. `tools/screenshots/cdp.mjs` now
+answers `Page.javascriptDialogOpening` itself and records it (`session.dialogs`).
+
+**2. The delete itself was broken on this line (and no unit test could see it).**
+
+```
+POST /api/custom-mode/delete {"id":"custom-2"}  → 400 {"ok":false,"code":"noRemoveApi", …}
+$ ls $DSH_HOME/.agent-presets/  →  custom  custom-2      ← still there
+```
+
+The declarative line has no `agentPresets.remove()` (unregistering = the disposer from `register()`), and the
+host half demanded that API. The declarative backend now disposes the registration and deletes the
+directory; `test/preset-backend.test.mjs` (new, 15 checks) pins it.
+
+**3. The shell does not hand a third-party client plugin its atom library on this line.**
+
+The panel renders `Button/Input/Switch/Tag/Pill` from the plugin's own fallback set, so rows are
+`input[type=checkbox]` — not the shell's `[role=switch]`. Measured on the rendered panel:
+
+```
+{ "text": "基础压缩 已启用 ▸", "switches": 0, "inputs": 1, … }   (one line per row)
+```
+
+`browser-verify`'s switch assertions now read either shape (and assert that at least one is rendered), so the
+gate passes on both lines instead of only on the one where the atoms happen to be provided.
+
+**After the three fixes, twice in a row on the same instance:**
+
+```
+$ CDP_PORT=9222 node tools/browser-verify.mjs --url "…"
+结果: 58 通过, 0 失败          (run 1)
+结果: 58 通过, 0 失败          (run 2)
+$ ls $DSH_HOME/.agent-presets/  →  custom        ← the create/delete round trip left nothing behind
+```
+
+
+## 29. "It feels cheap" was one line of JavaScript (2026-09-25, 1.9.16)
+
+Context: the settings page looked visibly unlike the rest of dsh. Measured on a throwaway `DSH_HOME`, dsh
+`0.1.7-rc.2`, Chromium 153 over CDP.
+
+**1. The atom-library probe was wrong.** The page resolved the shell's primitives with
+`typeof atoms.Button === "function"`, but the shell's components are `forwardRef(...)` objects — so the probe
+failed and the page silently used its own plain controls. Measured what `require` actually returns:
+
+```
+__CM_RAW = {"type":"object","keys":279,
+            "first":["BrandWordmark","Button","CODE_HIGHLIGHT_EXTENSIONS","Checkbox","CodeBlock",…],
+            "button":"object"}          ← an object: forwardRef
+$ grep -o 'function WS(){return{.*}}' frontend/index-*.js
+function WS(){return{react:yf,"react/jsx-runtime":jf,"react-dom":Lf,"react-dom/client":Tf,
+  "@deepseek-ai/cordis":Jd,"@deepseek-ai/dsh-client-store":th,"@deepseek-ai/dsh-client-ui-slots":lh,
+  "@deepseek-ai/dsh-client-ui-primitives":qb,"@deepseek-ai/dsh-client-ui-dockkit":FS}}
+```
+
+So the module had been in the platform seed table all along. After the probe was fixed to accept anything React
+can render (`$$typeof`), the rendered page went from **0** `[role=switch]` / 33 hand-painted checkboxes to
+**33** `[role=switch]` / 0 checkboxes, and its icons appeared (they had never rendered: the page asked for
+`IconPlusOutline16`, the shell exports `IconPlusOutlineRegular`).
+
+**2. Our own CSS was on a different scale from the official settings pages.** Measured on the official General
+page (same instance) and on ours:
+
+```
+official section title   14px/22px w500          ours (before) 15px/22px w700
+official section intro   12px/18px tertiary      ours (before) a click-to-expand dot per heading
+official settings row    padding:16px 0, no background, no radius, 1px divider between rows
+ours (before)            rounded, bordered, tinted card per row (radius 10, 0.5px + bg-layer-1)
+official dropdown        ghost button + chevron + Menu panel (padding 0 8px, radius 8)
+ours (before)            pills for assistants; a native <select> for history
+```
+
+After aligning to those numbers, `tools/browser-verify.mjs` asserts them so the drift cannot come back:
+"section titles are 14px/22px/500", "intros are 12px/18px tertiary", "rows are flat (no radius, no fill)",
+"rows use padding 16px 0", "1px dividers between rows", "the row switch is the shell's `[role=switch]`, 0
+hand-painted checkboxes". Full gate: **65/65** on `0.1.7-rc.2`.
+
+Screenshots: `docs/images/` (regenerated from this build) and `editor/assets/storefront-0*.png`.
+
+## 30. The desktop app is already in the repository; an undeclared 0.2.0 is not (2026-09-27)
+
+The question: dsh 0.2.0 (with the desktop app) was said to be close, and plugins might be adaptable early —
+is it already published but simply unannounced? Measured on 2026-09-27:
+
+```
+$ npm view @deepseek-ai/dsh dist-tags
+{ "latest": "0.1.7-rc.2", "alpha": "0.1.7-alpha.2", "next": "0.1.7-rc.2" }
+$ npm view @deepseek-ai/dsh versions --json | tail
+... 0.1.7-alpha.1, 0.1.7-alpha.2, 0.1.7-rc.1, 0.1.7-rc.2        (27 versions; nothing 0.2.x)
+$ curl -s https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/master/package.json | head -3
+{ "name": "@deepseek-ai/dsh-root", "version": "0.1.7-rc.2", ...
+$ gh api repos/deepseek-ai/deepseek-harness/git/refs/tags --jq '.[].ref' | tail -2
+refs/tags/dsh-v0.1.7-rc.1
+refs/tags/dsh-v0.1.7-rc.2
+```
+
+So there is no undeclared 0.2.0 to adapt to: the published runtime, the repository head and the newest tag
+are all 0.1.7-rc.2. What *is* already in the repository is the **desktop application**:
+
+```
+apps/desktop/package.json       "@deepseek-ai/dsh-desktop"       0.1.7-rc.2   "private": true
+apps/desktop-host/package.json  "@deepseek-ai/dsh-desktop-host"  0.1.7-rc.2   "private": true
+```
+
+Both are private packages, so they ship as signed Electron installers rather than on npm. The app is
+"an Electron shell around the complete dsh Web application", and its release-identity rule is that Electron
+and `@deepseek-ai/dsh` always carry the same exact version. That makes the desktop a target that can be
+supported **today**, without waiting for 0.2.0 — provided the plugin is installed the way the app allows.
+
+The app owns `$DSH_HOME/profiles/desktop`, and that is not a convention — the CLI is refused at runtime:
+
+```
+$ DSH_HOME=/root/dsh-desktop-lab dsh plugin --profile desktop add ./editor
+error: profile "desktop" is managed exclusively by the Electron application
+```
+
+`install.sh` now refuses that profile with the same advice (install from the app's **Plugins** page;
+`DSH_ALLOW_DESKTOP_PROFILE=1` exists only for local simulations of the profile shape), so the script and the
+runtime agree instead of one working around the other. The preset half needs nothing special:
+`.agent-presets/` is product data shared by the desktop app and the CLI, and the plugin seeds it on first
+activation.
+
+Compatibility has a declared mechanism, and that is what a future line has to satisfy: dsh evaluates every
+plugin peer dependency on `@deepseek-ai/dsh` against the running runtime (prereleases included) and warns
+when the range does not cover it — `packages/boot/app-boot/src/plugin-compatibility.ts`, tests alongside.
+Our range deliberately stops below `0.2.0-0`, so a 0.2.x runtime gets that warning until the line is adapted
+and re-tested, instead of a silent "probably fine".
+
+## 31. dsh 0.2.0-rc.1: what actually changed for a plugin (2026-09-28)
+
+`@deepseek-ai/dsh@0.2.0-rc.1` appeared under npm's `next` tag (27 versions before it; the newest was
+`0.1.7-rc.2`), with tag `dsh-v0.2.0-rc.1` in the repository. Measured, in this order:
+
+**1. A release is not finished when `npm view` shows it.** The first install failed — and not because of us:
+
+```
+$ npm i -g --prefix /root/dsh020 @deepseek-ai/dsh@0.2.0-rc.1
+npm error code ETARGET
+npm error notarget No matching version found for @deepseek-ai/dsh-client-ui-settings-account@0.2.0-rc.1.
+npm error notarget In most cases you or one of your dependencies are requesting a package version that
+npm error notarget doesn't exist.
+```
+
+Publish times from the registry: `@deepseek-ai/dsh@0.2.0-rc.1` at 12:34:03Z, that dependency at
+12:54:22Z. Of the 79 `@deepseek-ai/*` dependencies dsh declares, 74 were already up when the runtime
+landed. Trial 4 (a few minutes later) installed cleanly. **Retry before blaming the plugin.**
+
+**2. 0.2.0 turns the compatibility warning into an install gate.** The plugin (1.9.18, whose range stops
+below `0.2.0-0`) was refused outright:
+
+```
+$ DSH_HOME=/root/dsh-020 ./install.sh
+dsh: installation rejected: Plugin dsh-custom-mode@1.9.18 is incompatible with dsh 0.2.0-rc.1:
+peerDependencies {"@deepseek-ai/dsh":">=0.1.5-rc.2 <0.2.0-0 || >=0.1.6-alpha.1 <0.2.0-0 ||
+>=0.1.7-alpha.1 <0.2.0-0"}. Running it may cause crashes or data loss. Update the plugin or install a
+plugin version compatible with this dsh runtime. To accept this risk explicitly, grant the exact-version
+exemption for dsh-custom-mode@1.9.18 on dsh 0.2.0-rc.1 with `dsh plugin allow-version` or the plugin
+manager, then retry the installation or restart dsh. Exact-version exemption: not active.
+```
+
+That is the whole mechanism: the declared `peerDependencies["@deepseek-ai/dsh"]` range is the switch, so
+"supporting a line" and "declaring the range" are the same act. The range now ends `|| >=0.2.0-0 <0.3.0-0`.
+
+**3. After the range: install, boot, suite, picker, page — all green on 0.2.0.**
+
+```
+$ DSH_HOME=/root/dsh-020 ./install.sh            # installs into the web profile
+$ DSH_HOME=/root/dsh-020 dsh --profile web --dump-config | grep -c dsh-custom-mode
+2
+
+$ grep custom-mode /root/dsh-lab/dsh020-lab.log
+custom-mode: backend=declarative · 有: list,register,inventory,select,document · 无: remove,copy,read ·
+  可选能力缺失: agentPresets.remove()、agentPresets.copy()          ← identical to 0.1.7
+
+$ node test/run.mjs                                # host = 0.2.0-rc.1, fixture derived from its declaration
+15 个套件全部通过（801 项）
+
+$ node tools/picker-probe.mjs --url <url> --expect 自定义模式
+选择器里的模式：["Standard mode","PTC mode","Minimal mode","Creator mode","自定义模式"]
+✓ 期望的模式都在：自定义模式
+
+$ node tools/browser-verify.mjs --url <url> --out /root/verify020.png
+结果: 65 通过, 0 失败        ← including the official-metrics assertions (14px/22px w500 titles,
+                               12px/18px tertiary intros, flat rows + 1px dividers, [role=switch])
+```
+
+**4. The desktop app keeps its shape.** At the 0.2.0-rc.1 tag, `apps/desktop/package.json` is
+`@deepseek-ai/dsh-desktop` version `0.2.0-rc.1` (`private`, so it ships as signed installers), and its
+README still says the same three things: Electron owns `$DSH_HOME/profiles/desktop`, the CLI cannot mutate
+it, and plugin changes go through the shared Web plugin manager. So the 1.9.18 desktop story carries over
+unchanged — install from the app's Plugins page.
+
+**5. One measurement that is NOT a bug in either side.** The seed suite's P0 check ("every enabled row of
+the derived composition resolves in the local install") failed once, with 23 rows listed. The cause was the
+lab machine: `unresolvableRows()` probes the tree that `@deepseek-ai/dsh-agent-presets` resolves to, which
+on that machine was the repository's own fixture copy, not the host under test. With the host installed
+into the repository the way CI does it (`npm install --no-save @deepseek-ai/dsh@0.2.0-rc.1`), the same
+check passes. Worth writing down because the failure looks like a product bug and is not.
+
+## 32. 1.10.0: dsh 0.2.0-rc.2 on a clean home, and the repository root becomes the package (2026-09-30)
+
+**1. The npm one-click path, run for real on rc.2.** A throwaway `DSH_HOME`, `dsh` = 0.2.0-rc.2:
+
+```
+$ export DSH_HOME=/tmp/dsh-rc2-verify; mkdir -p "$DSH_HOME"
+$ dsh plugin --profile web list
+dsh: initialized profile web at /tmp/dsh-rc2-verify/profiles/web
+$ systemd-run --unit=rc2-official --collect --wait --pipe -p MemoryMax=1000M \
+    --setenv=DSH_HOME=/tmp/dsh-rc2-verify dsh plugin --profile web add dsh-custom-mode
+dependencies:
++ dsh-custom-mode ^1.9.19
+Done in 242ms using pnpm v12.4.2          ← unit runtime 640ms, memory peak 44.1M
+$ dsh --profile web --dump-config | grep -c '^- id: '
+184
+$ dsh --profile web --dump-config | grep -A1 'dsh-custom-mode'
+# == dsh-custom-mode
+  name: dsh-custom-mode
+```
+
+**2. Booted it too — seeding and registration both happen.**
+
+```
+custom-mode: 已播种 preset 到 /tmp/dsh-rc2-verify/.agent-presets/custom（新建 5 个文件: agent.cordis.yml,
+  preset.yml, prompt.md, prompt-reader.mjs, prompt-tool.mjs）
+custom-mode: backend=declarative · 有: list,register,inventory,select,document · 无: remove,copy,read
+custom-mode: 已注入 95 个出厂行模块名（compositionInventory）
+custom-mode: 已取回 4 个基础模式的出厂组成（standard、ptc、minimal、cordis）
+custom-mode: 声明式注册表同步完成 —— 目标 1 个助手，成功 1 个（custom）
+```
+
+So on 0.2.0-rc.2 the install, composition, seeding and registration steps are step-for-step what
+0.2.0-rc.1 did: **no code change was needed**, because the declared range already covered
+`>=0.2.0-0 <0.3.0-0`. 1.10.0's action here is verification plus moving the CI pin.
+
+**3. The GitHub-URL install still works — and that is the point.** The same command against
+`github:BOWLUNA/dsh-custom-mode` (which reads the repository-root manifest) succeeds:
+
+```
++ dsh-custom-mode github:BOWLUNA/dsh-custom-mode
+Done in 1.8s using pnpm v12.4.2
+```
+
+It worked before 1.10.0 as well (`private: true` does not stop pnpm) — but the manifest it read was *not*
+the one npm published, and that is exactly what made catalogues render `#editor` and made dshfind report
+"not published to npm".
+
+**4. The published package did not change.** `npm pack --dry-run` from the repository root:
+
+```
+LICENSE, README.i18n.yaml, README.md, README.zh.md, assistants.mjs, atomic.mjs, base-composition.mjs,
+client.js, composition.mjs, cordis.patch.yml, index.mjs, journal.mjs, locales.mjs, meta.mjs, package.json,
+paths.mjs, preset-backend/declarative.mjs, preset-backend/detect.mjs, preset-backend/index.mjs,
+preset-backend/parse-composition.mjs, preset/agent.cordis.yml, preset/preset.yml, preset/prompt-reader.mjs,
+preset/prompt-tool.mjs, preset/prompt.md, seed.mjs
+total files 26 size 149kB
+```
+
+Against 1.9.19's tarball the runtime files are identical (and `editor/preset/` already was byte-identical to
+`preset/`), so what a user installs is unchanged; the only additions are npm's own auto-includes
+(`README*`), because the repository README is the npm landing page now.
+
+**5. Guards.** `node test/run.mjs` → 15 suites / **805 checks** (the manifests suite was rewritten for the
+single manifest; the seed suite now asserts the packaged preset *is* `preset/` instead of that two copies
+match). `verify-doc-numbers`, `verify-translation-pairing`,
+`verify-version-consistency --dsh 0.2.0-rc.2` and `--dsh 0.1.7-rc.2`, and `bash -n` on both scripts all
+pass.
+
+> Sections above this one mention `editor/...` paths: those are records of the **pre-1.10.0** layout and are
+> kept as measured. From 1.10.0 the package is the repository root, so drop the `editor/` prefix
+> (`client.js`, `index.mjs`, `preset/`, `package.json`).
+
+
+## 33. 1.11.0: the fifth base mode is a union — and the union would have shipped a broken preset (2026-10-01)
+
+**1. The gap, counted.** `renderComposition(modeId, overrides)` rewrites the `disabled:` of rows in the
+base mode's *shipped text*, so a row that text does not contain cannot be reached by a switch at all.
+Counting each shipped composition on `0.2.0-rc.2`:
+
+```
+standard  32 rows
+ptc       33
+cordis    33
+minimal    7
+union     40     ← the new mode
+```
+
+Picking standard therefore left eight rows unswitchable: `tool-presentation` (ptc only), the
+`persistent-shell` group — `pty`, `terminal-bash`, `persistent-bash`, `terminal-pwsh`, `persistent-pwsh`
+(minimal only) — and `tool-cordis` (cordis only).
+
+**2. The union was broken, and no unit test could see it.** Writing the union composition into
+`.agent-presets/custom/agent.cordis.yml` and really starting the harness, then asking the instance's own
+API:
+
+```
+$ curl -s -b "$JAR" …/api/custom-mode
+{"ok":true,"assistants":[{"id":"custom",…,
+  "broken":"persistent-bash (@deepseek-ai/dsh-tool-bash-persistent):
+            tool \"bash\" is already registered in this scope"}]}
+```
+
+A `broken` preset is dropped from **every** picker — while the settings page's own signals were all green
+(`ok:true`, `warnings:[]`, `unresolvable:[]`). That is the P0 shape this repository has shipped twice
+before, and it was invisible to 828 passing checks.
+
+Root cause: minimal's `persistent-shell` set and standard's `tool-bash` / `tool-pwsh` are two
+implementations of the same thing — both register a tool called `bash`. Minimal never collides only
+because it does not *have* the standard rows.
+
+**3. Which rows collide, measured.** Six variants, each written to disk and really started, reading `broken`:
+
+| composition | `broken` |
+| --- | --- |
+| union as-is | ✗ `persistent-bash` / `tool-bash` |
+| union, `persistent-shell` off | ✓ null |
+| union, `tool-bash` + `tool-pwsh` off | ✓ null |
+| union, both sides off | ✓ null |
+| union without the `persistent-shell` group | ✓ null |
+| union without `tool-presentation` / `tool-cordis` | ✗ still broken ⇒ those two are innocent |
+
+Two consequences, both measured: **a disabled row does not collide** (so the group can be carried and
+switched), and the conflict is exactly the two shell sets.
+
+**4. The shipped default cannot be "whatever the source mode shipped".** `persistent-shell` is *enabled*
+in minimal — that is what minimal is. So a union that copied each row's shipped state produced an
+**invalid default**: `POST /state` with `mode: all` and `overrides: {}` answered `code: saved` while the
+roster immediately reported `broken` (no restart needed).
+
+Fixed by `EXCLUSIVE_ROW_SETS` in `composition.mjs`: the union disables the non-preferred side at synthesis
+time, so the default composition is valid.
+
+**5. A user could still break it, so the save path resolves it.** Turning `persistent-shell` on while the
+standard shell stays on is the *primary* use of that group, not an exotic case. `broken` is visible live,
+so `saveState` now calls `applyRowExclusivity()` and reports what it moved:
+
+```
+$ POST /state {mode: all, overrides: {persistent-shell: true}}
+    ok=true  code=savedWithExclusiveRows  rows="tool-bash"
+    磁盘: tool-bash=off  persistent-shell=on  mode=all
+    broken = null
+```
+
+A conflicting composition written **outside** the page (hand edit, another tool, a direct API call) is
+named on the page through the existing warning channel (`exclusiveRowsActive`).
+
+**6. Verified end to end on both supported lines.** Same script, two harnesses (`0.2.0-rc.2` and
+`0.1.7-rc.2`), four steps each — switch to `all`, flip the exclusive side, flip back, read the page state:
+
+```
+modes=["standard","ptc","minimal","cordis","all"]
+warnings=[]   unresolvable=[]   stderr 0 bytes
+broken = null at every step
+```
+
+`tools/boot-check.mjs` passes A/B/C/D on both lines (ports 32010 and 32013).
+
+**7. Guards.** `node test/run.mjs` → 15 suites / **850 checks** (was 805). Eleven mutations were run against
+copies, and each went red on the assertion meant to catch it:
+
+| mutation | red on |
+| --- | --- |
+| union silently continues past a source that failed to resolve | `并集在残缺目录里是类型化失败` |
+| union drops the top-level dedupe | `并集里没有重复行 id` · `并集顶层没有重复 id` · `all: 开关可反推` |
+| `UNION_MODE_ID` renamed back to `custom` | `并集模式的 id 不与任何出厂模式重名` · route test · `base.custom.label` |
+| union degrades to standard only | `并集覆盖四个出厂模式的每一行` · `并集确实比单独选 standard 多出行来` |
+| union stops disabling the exclusive side | `并集默认在每一组互斥里只留一侧启用` |
+| the exclusivity table names a row that does not exist | `互斥表里的行 id 都真的存在于出厂组成里` |
+| `unionDefaultOff` emptied | `并集默认在每一组互斥里只留一侧启用` |
+| `applyRowExclusivity` returns the switches unchanged | 8 assertions across both suites |
+| `saveState` stops reporting `savedWithExclusiveRows` | `用专门的 code 说明动过开关` |
+| `configWarnings` stops naming the conflict | `页面外写进去的互斥组合会被点名` |
+| auto-off writes `false` for rows that were already off | `只动本来就启用着的行` |
+
+**8. Three defects found in the new code and tests themselves**, kept here because the shape is the
+reusable part:
+
+- `composition.mjs` re-exported `BaseCompositionUnavailableError` with `export { … } from …`, which creates
+  an export but **not a local binding**. `unionCompositionText()` threw it and got a `ReferenceError`
+  instead — the page would have answered **500 rather than degrading**. Caught by the new child-process
+  assertion on its first run.
+- That assertion read the child's **stdout**; writes to a pipe are asynchronous and the child exits
+  immediately, so only the first line ever arrived. It now writes its verdict to a **file** — the failure
+  detail shows `"standard=ok\nunion=ok"` under the silent-drop mutation.
+- Mutation M7 (emptying `unionDefaultOff`) stayed **green**: "the rows listed are turned off" is vacuously
+  true for an empty list. Rewritten as "each exclusive set has **exactly one** side enabled", which is
+  insensitive to which side upstream prefers but cannot pass with both sides on.
+
+## 34. 1.11.1: the official desktop app, really run — and the preset that stayed broken while the page said it was fine (2026-10-01)
+
+**1. What was run.** `C:\Users\BOWLUNA\AppData\Local\Programs\DeepSeek Harness\DeepSeek Harness.exe`,
+FileVersion `0.2.0-rc.2`, Electron 152. Its `DSH_HOME` is `~/.dsh` and its profile is `desktop`
+(`dsh-profile-desktop`, bundles `dsh-base` + `dsh-web-app` + four experimental ones). The Electron userData
+is `%APPDATA%\@deepseek-ai\dsh-desktop`, and the host listens on a **dynamic** port (19387 here), not the
+3080 recorded in `%LOCALAPPDATA%\dsh\dsh-url.txt` (that file is from 09-25 and stale).
+
+Two environment traps, both measured:
+
+- `resources/runtime/cli/bin/dsh.cmd` **sets `ELECTRON_RUN_AS_NODE=1` on purpose** — the desktop app runs the
+  Agent Host as a Node child of the Electron binary. So launching the app from a shell that already carries
+  `ELECTRON_RUN_AS_NODE=1` (WorkBuddy's children do) makes Electron degrade to plain Node and **no window
+  appears**. Clear it before launching.
+- `dsh --profile desktop` from the CLI is refused: **"profile \"desktop\" is managed exclusively by the
+  Electron application"**. The profile can only be booted by the app, so `--dump-config` is not available
+  for it; the plugin's stdout has to be read inside the app.
+
+**2. Installing works, and it installs itself.** `dsh plugin --profile desktop add dsh-custom-mode@1.11.0`
+through the app's own bundled CLI → `+ dsh-custom-mode 1.11.0`, and the app's Plugins page shows
+`已安装 1 · dsh-custom-mode` with the component `custom-mode` **运行中**. Nothing outside the plugin is
+needed — the same "one-click means self-sufficient" property verified on npm/GitHub in section 33.
+
+**3. The mode still did not appear, and the first repair made it worse.** The mode picker listed the four
+shipped modes only. Fetched from inside the app (same origin, so no token):
+
+```
+GET /api/custom-mode
+{"assistants":[
+  {"id":"custom","broken":"workflow-worker-thread (@deepseek-ai/dsh-workflow-worker-thread): never started"},
+  {"id":"writing-assistant","broken":"workflow-worker-thread (@deepseek-ai/dsh-workflow-worker-thread): never started"}]}
+```
+
+A `broken` preset is dropped from the picker. The plugin's own check had already caught this half —
+`warnings: ["unresolvableRows"]`, `unresolvable: [{"id":"workflow-worker-thread", …}]` — so the settings page
+offered **Fix for this line**, and clicking it disabled that row. Then:
+
+```
+GET /api/custom-mode      → both assistants still broken
+    "tool-workflow (@deepseek-ai/dsh-tool-workflow): waiting for workflowEngine
+     tool-ralph (@deepseek-ai/dsh-tool-ralph): waiting for workflowEngine"
+GET /api/custom-mode/state?id=custom
+    warnings: []        ← the page now claimed everything was fine
+    unresolvable: []    ← and our own check agreed
+```
+
+Disabling the engine left the two tools that **wait on** it unable to start. `unresolvableRows()` answers
+"is the module installed"; it cannot answer "did the service it needs come up". The page went green, the
+mode stayed missing, and **nothing in the UI could bring it back** — a dead end that only the desktop line
+exposed (the web line has the engine installed).
+
+**4. Two fixes.** `brokenRowIds()` parses the host's own diagnostic — lines of the form
+`<rowId> (<module>): <reason>` — and `readState` now raises `presetBroken` whenever the host reports
+`broken` and our own check cannot explain every row it names. `POST /repair` turns off those rows as well as
+the unresolvable ones, so repeated clicks converge instead of stalling.
+
+**5. A third fix, in the page.** The **Fix for this line** button rendered only for `unresolvableRows`. After
+the first repair that warning was gone, so the page told the user to click a button that was no longer on
+screen — the exact shape of dead end the warning was meant to prevent. It now renders for `presetBroken`
+too.
+
+**6. Verified end to end on the real app.** Install into the `desktop` profile → relaunch → account menu →
+Settings → Custom mode → **one** click on Fix for this line → restart:
+
+```
+GET /api/custom-mode → custom: OK        (the second assistant stays broken; it has its own engine row)
+mode picker → ["标准模式…", "PTC 模式…", "极简模式…", "创造模式…", "自定义模式 完整编码能力…"]
+```
+
+The picker re-reads the registry **at boot**, so a repair becomes visible after a restart — worth stating
+plainly, because the web line does not need one.
+
+**7. Screenshots.** All five re-shot, each exactly **800x800**: `01` now shows the five base-mode pills
+(Standard / PTC / Minimal / Cordis / Custom) and `04` lists Custom mode. `04` was the one image with a real
+composition problem: it used the shared fixed `PANEL` box, but the picker hangs off the **vertically centred**
+composer, so ~320 of its 800 rows were plain background. It now widens the viewport and aims an 800x800 box
+at the popup's own rect. Measured: popup `324x468` at y=569 → box y=400.
+
+**8. Guards.** 15 suites / **861 checks** (was 850). Three more mutations, each red on the assertion meant to
+catch it:
+
+| mutation | red on |
+| --- | --- |
+| `brokenRowIds` always returns `[]` | `brokenRowIds 抠出行 id` · `宿主点名的行被修复关掉` · `磁盘上真的关掉了` |
+| repair ignores the host's row ids again | `宿主点名的行被修复关掉` · `磁盘上真的关掉了` |
+| `readState` stops raising `presetBroken` | `宿主报 broken 且我们自己解释不了 → 点名 presetBroken` |
+
+## 35. 1.11.2: the settings page, measured against the native UI (2026-10-01)
+
+Four pieces of feedback came in against 1.11.1 (screenshots of the real desktop app). Each one was turned
+into a measurement of the **native** UI before anything was changed — the desktop app was still running with
+a CDP port open, so the comparison came from the same window, same theme, same viewport.
+
+**1. Type scale.** The native plugin page's card title measures **14px/20px, weight 500**, the native
+settings nav item **14px/22px, weight 500**, and its body/notes **12px/18px, tertiary** (`rgb(173,178,184)`).
+Ours had four sizes in play: `.cpfe-h` 14/22, `.cpfe-hint-line` 12/18 tertiary, `.cpfe-note` **11/16
+secondary** (`rgb(207,211,214)`), `.cpfe-desc` 13/20. So the same role — the note under a block — had two
+different sizes *and* two different colours. Collapsed to the native two (14/22 titles, 12/18 body), with
+13px kept for inputs because that is the shell's own input size. `.cpfe-h` stays at **22px** and
+`.cpfe-row-head` moves to **20px**: both exist natively, for those two roles.
+
+**2. The 35-vs-24 spacing.** Measured gap between consecutive blocks on our page came out as
+`35, 35, 24, 24, 24, 24`. The cause was not a missing margin — it was an **inherited** one: `.cpfe-note` is a
+`<p>`, and the UA stylesheet gives it `margin-block: 1em`, which at an 11px font is 11px. Blocks preceded by
+a note therefore sat 11+11 = 22px further apart. Fixed by making the margin explicit (`0 0 8px`), which is
+also why the font-size and the spacing had to be fixed together rather than one at a time.
+
+**3. Row height.** Measured: `.cpfe-row` **76px**, `.cpfe-line` 77px — against a native card of **83px that
+carries two lines of description**. Half the content at the same height. Padding 16px -> 12px and title
+line-height 22 -> 20 bring it to **66px**. Two further findings from the same loop:
+
+- Rows varied between **66 and 84px** because `.cpfe-row-note` had `overflow:hidden;text-overflow:ellipsis`
+  but **no `white-space:nowrap`** — a long note wrapped to two lines and grew the row. The native page
+  **elipsises** (`…backed by the packaged ripgrep binar…`), so `nowrap` is the native behaviour, not a
+  compromise; a `title` (already rendered) keeps the full text readable.
+- After `nowrap` the rows were **66 and 67** — a 1px split. Cause: `.cpfe-tag` has a 0.5px border, so a
+  badged line is 19px while an unbadged one is 18px. Pinning `.cpfe-row-badges` to `height:18px` makes
+  every row exactly 66px.
+
+**4. The mixed-language description.** `preset.yml` held
+`完整编码能力，系统提示词来自 prompt.md，可在设置页随时修改、下一步即生效。 / Full coding ability; …`
+as one string. This is not a fresh bug: `CHANGELOG` records 1.7.0 introducing a "short bilingual" description
+as the fix for an English-leak regression. The constraint behind it is real — the description is **product
+data**, and the shell localises its own shipped presets but cannot localise ours. So the template now ships
+**no description at all** (an absent description is a supported state), and
+`dropShippedDescription()` clears it **only** when the on-disk value is one of our own shipped strings,
+verbatim. The `noDescription` warning was removed with it: defaulting to empty while permanently showing a
+warning is self-contradictory, and the description field's placeholder already says it may be left blank.
+
+**5. What the guards now assert.** The render gate went 67 -> **70**; the two new ones are the direct
+regressions for this round: *every row is exactly the same height*, and *the note never wraps*. A third
+asserts the ellipsised note still carries a `title`. The old `行用官方内边距 16px 0` was updated to 12px, and
+the description assertion now accepts empty (`有内容时才不许被截断`). Suite count 861 -> **869** (eight new
+seed checks for the description migration: both shipped strings cleared, the name untouched, user text
+untouched, already-empty is a no-op, missing file does not throw).
+
+**6. All five screenshots re-shot** — `02-plugin-switches.png` is the one that shows the change (uniform
+66px rows, even dividers), and `01-mode-switch.png` shows the five base-mode pills with the unified notes.
+
+## 36. Re-measuring the native metrics: two existing assertions were false, and three defects fell out (2026-10-02)
+
+§35 measured the settings page against the native UI once. This round **re-measured it** (trigger: the user
+asked for the fonts, UI style and formatting to match the native UI) by booting **a clean instance on each
+supported line** and putting the official settings page and ours in **the same browser**, reading
+`getComputedStyle` + `getBoundingClientRect` element by element. Both lines gave the same readings.
+
+### 1. Raw readings
+
+```
+official `_row` (settings row)   padding 16px/0/16px/0 · border-bottom 1px solid · radius 0 · h 77px with a note
+official `_title` (row title)    font-size 14px · line-height 22px · font-weight 400
+official `groupTitle` (group)    font-size 14px · line-height 22px · font-weight 400
+official `_selector` (dropdown)  h 36px · radius 12px · bg var(--dsw-alias-bg-module-platform) ·
+                                 padding 0 14px · font-size 14px · line-height 22px · gap 12px · text first
+official `input` (plugins page)  h 36px · radius 12px
+official `cardTitle` (card)      font-size 14px · line-height 20px · font-weight 500
+official `cardDescription`       font-size 12px · line-height 18px · white-space normal · h 36px (two lines)
+```
+
+### 2. Two assertions were false
+
+**① "Section title 14px/22px w500" → the official value is w400.** `AGENTS.md` #13, §29 and §35 all say
+w500. Measured once on each line, the official `_title` and `groupTitle` are **both 400**; the only 14px
+w500 in the shell is the plugin **card** title (line-height 20px, a different shape), and page titles are
+16px/24px w500. Changed to 400.
+
+**② "Row padding 12px" → the official settings row is 16px.** §35 deliberately moved 16px -> 12px to bring
+the row from 76px down to 66px ("the native *card* is 83px yet carries two description lines"). But the
+comparison target was a **card** (`cardContent`, padding 12px 14px) while our rows are **settings rows**
+(1px divider, title left, control right). More to the point, the cause of §35's "rows ranged 66–84px" was
+`.cpfe-row-note` missing `white-space:nowrap` — fixed separately in that same round. Lowering the padding
+was treating a disease that no longer existed. Back at 16px, a row with a note is **77px**, the same height
+as the official settings row.
+
+### 3. Three defects fell out
+
+- **The warning block had no CSS at all.** `.cpfe-warns` / `.cpfe-warn-row` / `.cpfe-warn` had **zero rules**
+  in any stylesheet (walking them returned `[]`), so every warning was a run of un-styled `<p>`. Now
+  12px/18px, `gap 6px`, the shell's `IconWarningOutlineRegular` at 14×14 aligned to the first text line
+  (measured offset 2px).
+- **The dropdown was not the native shape.** It used the shell Button's `ghost` + `size:"sm"` (28px /
+  transparent / 12px text / radius 8px) with the chevron **before** the text. The official control is
+  36px / radius-md / grey fill / 14px text with the chevron **after** it. Now drawn to those metrics
+  (`.cpfe-selector`) — the same approach the shell itself takes: each official settings page **defines its
+  own** `_selector` (four pages, four copies, identical metrics); the Button atom has no such variant.
+- **Input radii disagreed with each other.** input / desc / editor were 8px / 10px / 10px, while the official
+  control uses `--dsw-radius-md` (12px) whether it is a selector or an input. Unified.
+
+### 4. Terminology, copy, and the gate
+
+- **The `cordis` mode is presented as Creator mode in the official UI** (Chinese: 创造模式). Measured in
+  `dsh-client-ui-agent-preset`'s dictionary: `presetCordisName: "创造模式"` / `"Creator mode"` (same on
+  both lines). This repository labelled the pill 「Cordis 模式」 while `base.all.note` in the same
+  dictionary said 创造模式 — one mode with two names on one page. The four English labels
+  (Standard / PTC / Minimal / Cordis) were also all missing the official " mode" suffix; both fixed.
+- Three **dead entries** removed (`assistant.meta`, `aria.expandHint`, `aria.collapseHint`): they existed
+  only in the dictionaries and were never referenced by any call site (the `aria.*Hint` pair is a leftover
+  of the removed collapsible introduction).
+- The five `SectionHint` call sites each passed `id` / `expanded` / `onToggleExpand` / `t` — four props the
+  component **does not read**.
+- One **inaccurate claim**: the English `rows.hint` said the row list was "laid out like the official
+  plugin list", but the official plugin page is a **2-column card grid**
+  (`grid-template-columns: 274.5px 274.5px`) whose descriptions **wrap to two lines** — not the same thing
+  as our single-column, divider-separated list. The clause is gone.
+- The render gate went **70 -> 74**: the official dropdown shape, the chevron after the text, **the warning
+  block having rules in the stylesheet**, and the 14px/22px row title. The two false assertions were moved
+  to the measured values. Run once per line: `0.2.0-rc.2` and `0.1.7-rc.2` both **74 passed / 0 failed**.

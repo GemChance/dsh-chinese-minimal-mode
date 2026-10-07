@@ -1,14 +1,14 @@
 {
   "name": "dsh-chinese-minimal-mode",
-  "version": "1.0.0",
-  "description": "A DeepSeek Harness Minimal preset whose complete system prompt is loaded from an editable Markdown file.",
+  "version": "2.3.0",
+  "description": "A configurable DeepSeek Harness custom mode with a Minimal default and Markdown system prompt.",
   "license": "MIT",
   "type": "module",
-  "author": "GemChance",
-  "main": "./prompt-reader.mjs",
+  "author": "BOWLUNA; customized by GemChance",
+  "main": "./index.mjs",
   "exports": {
-    ".": "./prompt-reader.mjs",
-    "./prompt-reader": "./prompt-reader.mjs",
+    ".": "./index.mjs",
+    "./client": "./client.js",
     "./package.json": "./package.json"
   },
   "repository": {
@@ -20,31 +20,65 @@
     "url": "https://github.com/GemChance/dsh-chinese-minimal-mode/issues"
   },
   "keywords": [
+    "dsh",
     "deepseek",
     "deepseek-harness",
-    "dsh",
+    "deepseek-ai",
     "dsh-plugin",
+    "plugin",
+    "custom-mode",
+    "system-prompt",
+    "prompt-editor",
     "agent-preset",
-    "minimal-mode",
-    "system-prompt"
+    "assistant",
+    "base-mode",
+    "自定义模式",
+    "系统提示词",
+    "提示词编辑",
+    "DeepSeek插件"
   ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   },
   "files": [
+    "index.mjs",
+    "assistants.mjs",
+    "seed.mjs",
+    "atomic.mjs",
+    "client.js",
+    "composition.mjs",
+    "base-composition.mjs",
+    "meta.mjs",
+    "paths.mjs",
+    "locales.mjs",
+    "journal.mjs",
+    "defaults.mjs",
     "cordis.patch.yml",
-    "default-prompt.md",
-    "prompt-reader.mjs",
-    "README.md",
-    "LICENSE"
+    "LICENSE",
+    "NOTICE.md",
+    "postures.mjs",
+    "preset-backend/",
+    "preset/"
   ],
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node test/run.mjs",
+    "verify-translation-pairing": "node tools/verify-translation-pairing.mjs",
+    "verify-doc-numbers": "node tools/verify-doc-numbers.mjs",
+    "verify-version-consistency": "node tools/verify-version-consistency.mjs",
+    "verify-browser-literals": "node tools/verify-browser-literals.mjs",
+    "boot-check": "node tools/boot-check.mjs",
+    "union-mount-check": "node tools/union-mount-check.mjs",
+    "session-trace": "node tools/session-trace.mjs",
+    "browser-verify": "node tools/browser-verify.mjs",
+    "upgrade-preflight": "node tools/upgrade-preflight.mjs"
   },
   "peerDependencies": {
-    "@deepseek-ai/dsh": ">=0.2.0-0 <0.3.0-0"
+    "@deepseek-ai/dsh": ">=0.1.5-rc.2 <0.2.0-0 || >=0.1.6-alpha.1 <0.2.0-0 || >=0.1.7-alpha.1 <0.2.0-0 || >=0.2.0-0 <0.3.0-0 || >=0.2.1-alpha.1 <0.3.0-0"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh": {
@@ -53,6 +87,10 @@
   },
   "engines": {
     "node": ">=20",
-    "dsh": ">=0.2.0-0 <0.3.0-0"
+    "dsh": ">=0.1.5-rc.2 <0.2.0-0 || >=0.1.6-alpha.1 <0.2.0-0 || >=0.1.7-alpha.1 <0.2.0-0 || >=0.2.0-0 <0.3.0-0 || >=0.2.1-alpha.1 <0.3.0-0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "tag": "latest"
   }
 }

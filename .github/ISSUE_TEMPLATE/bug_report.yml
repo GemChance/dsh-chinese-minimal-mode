@@ -1,0 +1,98 @@
+name: Bug report
+description: Something is wrong after installing (dsh will not start, the page never appears, the mode is missing, a switch does nothing…)
+title: '[bug] '
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Spend a minute on [`docs/TROUBLESHOOTING.md`](https://github.com/BOWLUNA/dsh-custom-mode/blob/main/docs/TROUBLESHOOTING.md)
+        first: it documents the failures that were actually reproduced — a dsh that will not start after
+        installing, a settings page that never appears, a mode missing from the picker, a rejected save —
+        each with a cause and a way out.
+
+        Most failures here are **silent** (no error, the change just does not take effect), so the
+        details below are what decides whether the report can be diagnosed at all.
+
+  - type: input
+    id: dsh-version
+    attributes:
+      label: DSH version
+      description: 'the output of `dsh --version`'
+      placeholder: 0.1.7-rc.2（或正式版 0.1.5-rc.3）
+    validations:
+      required: true
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin version / commit
+      description: 'the `version` in `package.json`, or `git rev-parse --short HEAD`'
+      placeholder: 1.0.0 / ec34aa6
+    validations:
+      required: true
+
+  - type: dropdown
+    id: profile
+    attributes:
+      label: Which profile
+      options:
+        - web
+        - tui
+        - other (explain under "What happens")
+    validations:
+      required: true
+
+  - type: textarea
+    id: symptom
+    attributes:
+      label: What happens
+      description: What you see, and what you expected. Paste error text verbatim if there is any.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ./install.sh
+        2. restart dsh
+        3. open Settings → 自定义模式
+        4. …
+    validations:
+      required: true
+
+  - type: textarea
+    id: dump-config
+    attributes:
+      label: Composition self-check
+      description: |
+        This is what separates "installed but inert" from "not installed at all", and it is the direct
+        evidence for whether the base bundles are still present. Expect **hundreds** of lines.
+      render: shell
+      value: |
+        $ dsh --profile web --dump-config | wc -l
+        $ dsh --profile web --dump-config | grep -n custom-mode
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Startup log / browser console
+      description: |
+        Host-half diagnostics all start with `custom-mode:`; browser-side errors do too. This page's
+        failure policy is "rather not appear at all than take the page down", so it only speaks to the
+        console.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Ubuntu 24.04 / WSL2 / macOS 15 / Windows 11
+    validations:
+      required: true

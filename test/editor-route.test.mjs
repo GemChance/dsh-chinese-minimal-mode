@@ -1,0 +1,1189 @@
+/**
+ * Host-half HTTP route tests — the security-relevant file.
+ *
+ * Run: node test/editor-route.test.mjs
+ *
+ * Why this exists: `index.mjs` is the half that serves the settings page, and it is where the
+ * unauthenticated-read/write vulnerability lived (see docs/TROUBLESHOOTING.md §9 and SECURITY.md).
+ * It had NO test at all — the fix was verified by hand with curl. A hand check proves the fix worked
+ * once; it does not stop the fence from being moved, reordered or forgotten later.
+ *
+ * So this drives the real handler with real `Request`/`Response` objects and asserts:
+ *
+ *   - **the fence is structural**: every route is registered through
+ *     `ctx.connection.fetch.register` (the platform's `/api` channel, whose carrier applies the
+ *     Host/Origin fence and browser auth before dispatch), and the source contains no hand-rolled
+ *     `requestRejection` and no raw `webServer.register` — the exact shape that once let an
+ *     unauthenticated caller read and rewrite the prompt;
+ *   - a scoped `inject` that never gets its services registers NOTHING (rather than registering
+ *     something unfenced, or parking the row in `pending`);
+ *   - every endpoint: list / state read / state write / create / delete / reorder, including the
+ *     per-path method table (a GET must never reach `create`) and unknown sub-paths;
+ *   - the validation branches: bad JSON, bad mode, empty prompt, rejected interpolation,
+ *     oversized body, unknown assistant id;
+ *   - what the client half depends on: the `/api` prefix on both sides, and JSON responses.
+ *
+ * The roster stand-in below mirrors `@deepseek-ai/dsh-agent-presets` closely enough to matter:
+ * every directory under the user root becomes a row (even one whose composition is missing, which
+ * discovery reports as BROKEN rather than skipping), and `remove` deletes the directory.
+ *
+ * Self-contained on purpose: the shipped presets come from a fixture directory this test builds,
+ * so it needs neither dsh nor `@deepseek-ai/dsh-agent-presets` installed.
+ */
+
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+let passed = 0
+let failed = 0
+const check = (label, condition, detail = '') => {
+  if (condition) {
+    passed += 1
+    console.log(`PASS  ${label}`)
+  } else {
+    failed += 1
+    console.log(`FAIL  ${label}${detail === '' ? '' : '  → ' + detail}`)
+  }
+}
+
+const registeredRoutes = []
+const dir = mkdtempSync(join(tmpdir(), 'dsh-custom-route-'))
+// 与真实安装同样的层级：`<root>/node_modules/@deepseek-ai/dsh-agent-presets/presets`。
+// 这样 `<presets>/../../..` 就是夹具自己的 node_modules，unresolvableRows 才谈得上"能判断"。
+const shippedDir = join(dir, 'node_modules', '@deepseek-ai', 'dsh-agent-presets', 'presets')
+const userRoot = join(dir, 'agent-presets')
+const presetDir = join(userRoot, 'custom')
+const promptPath = join(presetDir, 'prompt.md')
+const compositionPath = join(presetDir, 'agent.cordis.yml')
+const presetMetaPath = join(presetDir, 'preset.yml')
+
+// ── 出厂 preset 夹具：本测试不依赖已安装的 dsh ────────────────────────────────
+const BASE_COMPOSITION = [
+  '# fixture base composition',
+  '',
+  '- id: persona',
+  "  name: './persona.mjs'",
+  '',
+  '- id: tool-bash',
+  "  name: '@deepseek-ai/dsh-tool-bash'",
+  "  disabled: !!js process.platform === 'win32'",
+  '',
+  '- id: tool-pwsh',
+  "  name: '@deepseek-ai/dsh-tool-pwsh'",
+  // ★ `!==` 不是 `===`：真实的出厂组成里，两套壳是**按平台二选一**的 —— `tool-bash` 在 Windows 上关、
+  //   `tool-pwsh` 在非 Windows 上关（实测：CI 的 windows 腿显示标准模式里开着的是 pwsh）。
+  //   夹具原先两行都写 `===`，于是在 Windows 上**两行同时关着**，"两套壳互斥"这一节就无从断言了。
+  "  disabled: !!js process.platform !== 'win32'",
+  '',
+  '- id: planning',
+  '  name: ./planning.mjs',
+  '  group: true',
+  '  config:',
+  '    label: 计划',
+  '  children:',
+  '    - id: plan-mode',
+  '      name: ./plan-mode.mjs',
+  '',
+  '- id: tool-web',
+  "  name: '@deepseek-ai/dsh-tool-web'",
+  '',
+  '- id: tool-off-by-default',
+  "  name: './tool-off.mjs'",
+  '  disabled: true',
+  '',
+].join('\n')
+
+// `minimal` 另有一份组成：它带 `persistent-shell` 组 —— 与标准的 `tool-bash` / `tool-pwsh` 互斥
+// （两套壳注册同名工具 `bash` / `pwsh`，实测 2026-10-01）。并集模式会把这一组并进来，所以互斥
+// 只可能在并集上触发 —— 夹具必须复现这一点，否则自动避让在路由层无从断言。
+const MINIMAL_COMPOSITION = BASE_COMPOSITION + [
+  '- id: persistent-shell',
+  '  name: cordis:group',
+  '  group: true',
+  '  children:',
+  '    - id: persistent-bash',
+  "      name: '@deepseek-ai/dsh-tool-bash-persistent'",
+  '',
+].join('\n')
+
+// 夹具自带"像真实安装"的 node_modules：`unresolvableRows` 只在能真正判断时（该根下有 `@deepseek-ai/`）
+// 才报警，否则"查不到"只说明我们不知道。这里放上夹具用到的包名，于是 fixture 里的正常行解析得到、
+// 而测试故意加的那行解析不到 —— 测试因此不依赖这台机器装了哪个 dsh。
+const shippedNodeModules = join(dir, 'node_modules')
+mkdirSync(shippedDir, { recursive: true })
+for (const pkg of ['dsh-tool-bash', 'dsh-tool-pwsh', 'dsh-tool-web', 'dsh-tool-bash-persistent']) {
+  mkdirSync(join(shippedNodeModules, '@deepseek-ai', pkg), { recursive: true })
+}
+mkdirSync(join(shippedDir, 'standard'), { recursive: true })
+mkdirSync(join(shippedDir, 'ptc'), { recursive: true })
+mkdirSync(join(shippedDir, 'minimal'), { recursive: true })
+mkdirSync(join(shippedDir, 'cordis'), { recursive: true })
+for (const mode of ['standard', 'ptc', 'minimal', 'cordis']) {
+  writeFileSync(join(shippedDir, mode, 'agent.cordis.yml'), mode === 'minimal' ? MINIMAL_COMPOSITION : BASE_COMPOSITION, 'utf8')
+  writeFileSync(join(shippedDir, mode, 'preset.yml'), `name: ${mode}\n`, 'utf8')
+}
+// 用户模式：本工具「拥有」一个模式的判据是 prompt.md + prompt-reader.mjs，
+// 所以夹具必须两样都有，否则它会被当成别人手写的模式而不出现在管理列表里。
+mkdirSync(presetDir, { recursive: true })
+writeFileSync(join(presetDir, 'prompt-reader.mjs'), '// fixture reader\nexport function apply() {}\n', 'utf8')
+writeFileSync(join(presetDir, 'prompt-tool.mjs'), '// fixture tool\nexport function apply() {}\n', 'utf8')
+
+// 路径在 import 时求值，所以这两个环境变量必须在 import 之前设好。
+process.env.DSH_CUSTOM_PROMPT_PATH = promptPath
+process.env.DSH_SHIPPED_PRESETS_DIR = shippedDir
+
+const { renderComposition, collectRows, setShippedPresetsDir } = await import('../composition.mjs')
+const { readPresetMeta } = await import('../meta.mjs')
+const editor = await import('../index.mjs')
+
+// 装上一份生成好的组合文件，让 readState() 有东西可读（和真实安装后的状态一致）
+writeFileSync(compositionPath, renderComposition('standard', new Map()), 'utf8')
+writeFileSync(promptPath, 'PROMPT-ORIGINAL\n', 'utf8')
+writeFileSync(presetMetaPath, 'name: "自定义模式"\n', 'utf8')
+
+// ── 桩：ctx / req / res ─────────────────────────────────────────────────────
+
+/**
+ * Mirror `agent-presets` discovery: every id-shaped directory under the root is a row, and the
+ * roster is ordered by `order` first, then id — which is why reordering writes `order` into
+ * `preset.yml` instead of keeping a list of its own.
+ */
+function rosterRows() {
+  const rows = [{ id: 'standard', trust: 'system', path: join(shippedDir, 'standard', 'agent.cordis.yml') }]
+  const user = []
+  for (const entry of readdirSync(userRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !/^[a-z0-9][a-z0-9-]*$/.test(entry.name)) continue
+    const directory = join(userRoot, entry.name)
+    const composition = join(directory, 'agent.cordis.yml')
+    const meta = readPresetMeta(directory)
+    user.push({
+      id: entry.name,
+      trust: 'user',
+      path: composition,
+      ...meta,
+      ...existsSync(composition) ? {} : { broken: 'the composition file agent.cordis.yml is missing' },
+    })
+  }
+  user.sort((left, right) => ((left.order ?? Number.POSITIVE_INFINITY) - (right.order ?? Number.POSITIVE_INFINITY)) || left.id.localeCompare(right.id))
+  return [...rows, ...user]
+}
+
+function makeCtx({ connectionAvailable = true } = {}) {
+  const agentPresets = {
+    async list() {
+      return rosterRows()
+    },
+    async remove(id) {
+      const row = rosterRows().find((entry) => entry.id === id)
+      if (row === undefined) throw new Error(`agent-presets: no configured root supplies ${id}`)
+      if (row.trust !== 'user') throw new Error(`agent-presets: ${id} ships with the deployment`)
+      rmSync(dirname(row.path), { recursive: true, force: true })
+    },
+  }
+  const scope = {
+    // Cordis 的作用域上也有 effect：注册路由时用它，disposer 交给宿主。
+    effect: (fn) => fn(),
+    agentPresets,
+    connection: {
+      fetch: {
+        register(route) {
+          registeredRoutes.push(route)
+          return async () => {}
+        },
+      },
+    },
+  }
+  return {
+    effect: (fn) => fn(),
+    // 作用域化的等待：真实 Cordis 会等到服务就绪再回调；这里用 connectionAvailable 模拟"等不到"。
+    inject: (deps, callback) => {
+      if (connectionAvailable) callback(scope)
+    },
+  }
+}
+
+/** 请求描述（不是 node 的 req）：call() 会把它变成真正的 Request。 */
+function makeReq(method, { url, headers = {}, body } = {}) {
+  return { method, url, headers, body }
+}
+
+/** 装一次插件，拿到它注册的全部 Fetch 路由。 */
+function mount(options = {}) {
+  registeredRoutes.length = 0
+  editor.apply(makeCtx(options))
+  return registeredRoutes
+}
+
+let mounted = mount()
+check('注册了路由', mounted.length > 0, String(mounted.length))
+
+console.log()
+console.log('=== 0. 浏览器半与宿主半的路由常量不许漂移 ===')
+{
+  // 两半各自硬写了一份路径（bundle 不能 import 宿主半）。改一边忘一边 = 页面 404 或
+  // 打到别的路由上，而且症状是「页面能开、功能全废」，所以直接对文本断言。
+  const clientSource = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
+  const match = /const ROUTE = "([^"]+)"/.exec(clientSource)
+  check('能从 client.js 里读出 ROUTE', match !== null)
+  check(
+    'client.js 的 ROUTE = /api + 宿主半的 ROUTE_PATH',
+    match !== null && match[1] === editor.API_PREFIX + editor.ROUTE_PATH,
+    `${match === null ? '(none)' : match[1]} vs ${editor.API_PREFIX + editor.ROUTE_PATH}`,
+  )
+
+  // 工具是同一组路径的**第三处副本**。1.0.3 把路由迁到 /api 之后，截图工具里还留着旧路径，
+  // 结果是"拿空响应当 JSON"（报错信息只有 "Unexpected end of JSON input"），而 CI 看不到 ——
+  // 截图工具要浏览器才能跑。所以这里对文本断言：任何 '/custom-mode' 前必须紧跟 /api。
+  for (const tool of ['tools/screenshots/screenshots.mjs', 'tools/browser-verify.mjs']) {
+    const source = readFileSync(new URL(`../${tool}`, import.meta.url), 'utf8')
+    const stale = [...source.matchAll(/(['"])\/custom-mode/g)].map((entry) => entry[0])
+    check(`${tool} 里没有漏掉 /api 前缀的路径`, stale.length === 0, stale.join(', '))
+  }
+}
+
+let handlerCalls = 0
+
+/**
+ * 跑一次请求：按"路径 + 方法"找到注册的路由，构造真正的 Request，返回 {statusCode, body}。
+ *
+ * 方法不匹配时**不调用 handler** 而是返回 404 —— 这正是平台的行为（Fetch 注册表按精确路径与方法
+ * 分发，未声明的方法根本到不了 handler）。实测：POST 打到 GET-only 路由 → 404。
+ */
+async function call(req) {
+  const url = new URL(req.url ?? editor.ROUTE_PATH, 'http://127.0.0.1')
+  const path = editor.API_PREFIX + url.pathname
+  const route = registeredRoutes.find((entry) => entry.path === path && entry.methods.includes(req.method))
+  if (route === undefined) return { statusCode: 404, body: '', headers: {} }
+  handlerCalls += 1
+  const request = new Request(`http://127.0.0.1${route.path}${url.search}`, {
+    method: req.method,
+    headers: req.headers,
+    ...req.body === undefined ? {} : { body: req.body },
+    // 流式请求体在 Node 的 fetch 里必须显式声明 duplex（用来测 chunked 绕过 content-length 的场景）。
+    ...req.duplex === undefined ? {} : { duplex: req.duplex },
+  })
+  const response = await route.fetch(request)
+  return { statusCode: response.status, body: await response.text(), headers: Object.fromEntries(response.headers) }
+}
+
+const post = (path, payload) =>
+  makeReq('POST', { url: path, headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) })
+
+console.log()
+console.log('=== 0.5 rename 重试：Windows 并发保存的 EPERM 窗口（可注入，因此在 Linux 上也能验）===')
+{
+  // Windows 上两个 rename 指向同一目标会短暂 EPERM/EBUSY；随机临时名解决不了 dest-vs-dest。
+  const attempts = []
+  let calls = 0
+  const flaky = (from, to) => {
+    calls += 1
+    attempts.push(calls)
+    if (calls < 3) { const error = new Error('EPERM: operation not permitted'); error.code = 'EPERM'; throw error }
+  }
+  let slept = 0
+  editor.renameWithRetry('a.tmp', 'a', { rename: flaky, sleep: (ms) => { slept += ms } })
+  check('EPERM 会被重试到成功', calls === 3, String(calls))
+  check('重试之间有退避', slept > 0, String(slept))
+
+  let hardCalls = 0
+  const hardFail = () => { hardCalls += 1; const error = new Error('ENOENT'); error.code = 'ENOENT'; throw error }
+  let thrown = null
+  try { editor.renameWithRetry('a.tmp', 'a', { rename: hardFail, sleep: () => {} }) } catch (error) { thrown = error }
+  check('非临时性错误立刻抛出，不重试', hardCalls === 1 && thrown !== null, `${String(hardCalls)} ${String(thrown?.code)}`)
+
+  let exhausted = 0
+  const alwaysBusy = () => { exhausted += 1; const error = new Error('EBUSY'); error.code = 'EBUSY'; throw error }
+  thrown = null
+  try { editor.renameWithRetry('a.tmp', 'a', { rename: alwaysBusy, sleep: () => {}, attempts: 4 }) } catch (error) { thrown = error }
+  check('一直 EBUSY 时按上限放弃并抛出', exhausted === 4 && thrown?.code === 'EBUSY', `${String(exhausted)}`)
+}
+
+console.log()
+console.log('=== 1. 结构：注册在平台带围栏的频道上，且源码里没有手搓围栏 ===')
+{
+  mounted = mount()
+  const paths = mounted.map((entry) => entry.path).sort()
+  const expected = [
+    '/api/custom-mode',
+    '/api/custom-mode/create',
+    '/api/custom-mode/delete',
+    '/api/custom-mode/history',
+    '/api/custom-mode/reorder',
+    '/api/custom-mode/repair',
+    '/api/custom-mode/state',
+  ]
+
+  check('注册了 7 条精确路径', mounted.length === 7, String(mounted.length))
+  check('路径集合正确（全部在 /api 之下）', JSON.stringify(paths) === JSON.stringify(expected), JSON.stringify(paths))
+  check('每条都声明了 requestBody: buffered', mounted.every((entry) => entry.requestBody === 'buffered'))
+  check('每条都有一个 fetch 函数', mounted.every((entry) => typeof entry.fetch === 'function'))
+  check(
+    'create / delete / reorder 只声明 POST（预取的 GET 不可能触发它们）',
+    ['/api/custom-mode/create', '/api/custom-mode/delete', '/api/custom-mode/reorder']
+      .every((path) => JSON.stringify(mounted.find((entry) => entry.path === path)?.methods) === JSON.stringify(['POST'])),
+  )
+  check(
+    'state 同时声明 GET 与 POST',
+    JSON.stringify(mounted.find((entry) => entry.path === '/api/custom-mode/state')?.methods) === JSON.stringify(['GET', 'POST']),
+  )
+  check(
+    'history 只声明 GET（取旧版本是读操作）',
+    JSON.stringify(mounted.find((entry) => entry.path === '/api/custom-mode/history')?.methods) === JSON.stringify(['GET']),
+  )
+
+  // 结构断言：这两样东西的存在本身就是旧漏洞的成因，所以直接对源码断言。
+  const source = readFileSync(new URL('../index.mjs', import.meta.url), 'utf8')
+  // 断言"没有调用"而不是"没有出现这个词"：注释里解释历史是应该的。
+  check('源码里不再调用手搓的 requestRejection()', !/requestRejection\s*\(/.test(source))
+  check('源码里不再注册裸 webServer 路由', !/webServer\s*\.\s*register/.test(source))
+  check('源码里确实用了 connection.fetch.register', source.includes('connection.fetch.register'))
+}
+
+console.log()
+console.log('=== 2. 等不到 connection 时什么都不注册（不是"注册了但没鉴权"）===')
+{
+  const routes = mount({ connectionAvailable: false })
+  check('没有注册任何路由', routes.length === 0, String(routes.length))
+  check('也没有抛异常', true)
+}
+
+console.log()
+console.log('=== 3. GET /custom-mode：助手列表 ===')
+{
+  mounted = mount()
+  const res = await call(makeReq('GET', { headers: { host: '127.0.0.1:3080' } }))
+  check('200', res.statusCode === 200, String(res.statusCode))
+  check('content-type 是 JSON', String(res.headers?.['content-type']).includes('application/json'), String(res.headers?.['content-type']))
+  check('cache-control: no-store（保存后不能读回旧状态）', res.headers?.['cache-control'] === 'no-store', String(res.headers?.['cache-control']))
+  // content-length 由载体（平台）在序列化时补齐，不由我们声明 —— 这里只断言内容类型与禁用缓存。
+
+  const payload = JSON.parse(res.body)
+  check('ok: true', payload.ok === true)
+  check('只列出本工具拥有的模式（custom），不含出厂模式', Array.isArray(payload.assistants) && payload.assistants.length === 1, JSON.stringify(payload.assistants))
+  check('带显示名', payload.assistants[0]?.name === '自定义模式', JSON.stringify(payload.assistants[0]))
+  check('带用户预设根目录', payload.root === userRoot, String(payload.root))
+}
+
+console.log()
+console.log('=== 4. GET /custom-mode/state：一个助手的完整状态 ===')
+{
+  mounted = mount()
+  const res = await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))
+  check('200', res.statusCode === 200, String(res.statusCode))
+  const state = JSON.parse(res.body)
+  check('ok: true 且带 id', state.ok === true && state.id === 'custom', JSON.stringify({ ok: state.ok, id: state.id }))
+  // 基础模式列表 = 出厂四位 + 并集模式（`all`）。这里**写死这五个**而不是"长度 ≥ 4"：并集模式是这一版
+  // 的功能本体，它从 payload 里消失就等于功能从界面上消失，而"长度够就行"的写法对这件事完全无感。
+  check(
+    '带基础模式列表（出厂四位 + 并集模式）',
+    Array.isArray(state.modes) && state.modes.map((mode) => mode.id).join(',') === 'standard,ptc,minimal,cordis,all',
+    JSON.stringify(state.modes?.map((mode) => mode.id)),
+  )
+  check('当前模式是 standard', state.mode === 'standard', state.mode)
+  check('带行树', Array.isArray(state.rows) && state.rows.length > 0, String(state.rows?.length))
+  check('带提示词文本', state.prompt === 'PROMPT-ORIGINAL\n', JSON.stringify(state.prompt))
+  check('行里有首次出现的 group 结构', state.rows.some((row) => row.id === 'planning' && row.group === true))
+  check('带路径信息（页面底部显示）', state.compositionPath === compositionPath, String(state.compositionPath))
+  check('平台条件在宿主端求值为"已停用"（Linux 上 pwsh）', state.rows.find((row) => row.id === 'tool-pwsh')?.disabledExpression !== null)
+
+  // 「配置了却不生效」的告警码：这里的状态是出厂种子（有名字、身份行开着），所以**一条都不该报** ——
+  // 误报比不报更糟（用户会学会忽略它）。夹具没写描述也**不**告警：1.11.2 起描述默认留空
+  // （产品数据没法按界面语言本地化），默认留空还弹 ⚠ 是自相矛盾的。
+  check(
+    '默认状态一条告警都不报（描述留空不算问题）',
+    JSON.stringify(state.warnings) === '[]',
+    JSON.stringify(state.warnings),
+  )
+
+  // 关掉身份行（系统提示词）：此时 prompt.md 根本不会被注入 —— 必须主动点名。
+  const personaOff = await call(post('/custom-mode/state', {
+    id: 'custom', mode: 'standard', prompt: '我写的提示词\n', overrides: { persona: false },
+  }))
+  check('保存成功（关掉身份行，准备阶段）', personaOff.statusCode === 200, personaOff.body.slice(0, 80))
+  const warned = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))).body)
+  check(
+    '关掉身份行 + 有提示词 → 报「提示词不生效」',
+    warned.warnings.includes('personaOffWithPrompt'),
+    JSON.stringify(warned.warnings),
+  )
+  // 把提示词清空就说不上"不生效"了 —— 告警必须跟着条件消失，否则用户会学会忽略它。
+  const cleared = await call(post('/custom-mode/state', {
+    id: 'custom', mode: 'standard', prompt: '还是有点内容\n', overrides: { persona: false },
+  }))
+  check('仍然开着时依旧报警', cleared.statusCode === 200 && JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))).body).warnings.includes('personaOffWithPrompt'))
+
+  // 「恢复出厂提示词」的数据来源：宿主必须把出厂模板一起给页面，否则那个按钮只能置灰。
+  check(
+    'state 带出厂提示词（新建助手时得到的那一份）',
+    typeof state.factoryPrompt === 'string' && state.factoryPrompt.includes('你是一个中文助手'),
+    JSON.stringify(state.factoryPrompt).slice(0, 70),
+  )
+  check(
+    '出厂提示词与打包模板逐字节一致',
+    state.factoryPrompt === readFileSync(new URL('../preset/prompt.md', import.meta.url), 'utf8'),
+  )
+  // 恢复之后必须能保存：出厂文本若过不了自己的校验，这个按钮就是个陷阱。
+  const savedFactory = await call(post('/custom-mode/state', { id: 'custom', mode: 'standard', prompt: state.factoryPrompt }))
+  check('出厂提示词能原样保存（恢复 → 保存这条链路成立）', savedFactory.statusCode === 200, `${savedFactory.statusCode} ${savedFactory.body.slice(0, 80)}`)
+
+  const unknown = await call(makeReq('GET', { url: '/custom-mode/state?id=nope' }))
+  const unknownBody = JSON.parse(unknown.body)
+  check('未知 id → 200 且 ok:false（页面能显示原因）', unknown.statusCode === 200 && unknownBody.ok === false, unknown.body.slice(0, 90))
+  check('未知 id 的说明指出这是本工具不管理的模式', /找不到助手/.test(String(unknownBody.error)), String(unknownBody.error).slice(0, 80))
+
+  const noId = await call(makeReq('GET', { url: '/custom-mode/state' }))
+  check('缺 id → ok:false，不崩', JSON.parse(noId.body).ok === false, noId.body.slice(0, 80))
+}
+
+console.log()
+console.log('=== 5. POST /custom-mode/state：写盘与校验 ===')
+{
+  mounted = mount()
+  const good = await call(
+    post('/custom-mode/state', {
+      id: 'custom',
+      mode: 'standard',
+      overrides: { 'tool-web': false, 'tool-off-by-default': true },
+      prompt: 'PROMPT-NEW\n',
+      name: '我的模式: 测试',
+      description: 'a "quoted" one',
+    }),
+  )
+  check('合法保存返回 200', good.statusCode === 200, String(good.statusCode))
+  check('响应体 ok:true 且带 note', JSON.parse(good.body).ok === true && typeof JSON.parse(good.body).note === 'string')
+  check('提示词已落盘', readFileSync(promptPath, 'utf8') === 'PROMPT-NEW\n', JSON.stringify(readFileSync(promptPath, 'utf8')))
+
+  const written = readFileSync(compositionPath, 'utf8')
+  check('组合文件带生成表头', written.startsWith('# 本文件由'), written.slice(0, 40))
+  check('表头记录了这是哪个助手', /^# 助手: 我的模式: 测试 \(custom\)$/m.test(written), written.split('\n').slice(0, 4).join(' | '))
+  const webRow = written.split(/^- id: /m).find((chunk) => chunk.startsWith('tool-web'))
+  check('显式关闭的行写成 disabled: true', webRow !== undefined && /^\s*disabled: true$/m.test(webRow))
+  const offRow = written.split(/^- id: /m).find((chunk) => chunk.startsWith('tool-off-by-default'))
+  check('显式打开出厂关闭的行 → 删掉 disabled', offRow !== undefined && !/^\s*disabled:/.test(offRow))
+  const bashRow = written.split(/^- id: /m).find((chunk) => chunk.startsWith('tool-bash'))
+  check('未触碰的行保留 !!js 平台条件', bashRow !== undefined && /disabled: !!js process\.platform/.test(bashRow))
+  check('custom_prompt 行带上了本助手的名字', /modeName: "我的模式: 测试"/.test(written), written.slice(-260))
+
+  const meta = readFileSync(presetMetaPath, 'utf8')
+  check('preset.yml 被写入且值被引号包裹', meta.includes('name: "我的模式: 测试"'), JSON.stringify(meta))
+  check('preset.yml 里的引号被转义', meta.includes('description: "a \\"quoted\\" one"'), JSON.stringify(meta))
+
+  const badJson = await call(makeReq('POST', { url: '/custom-mode/state', headers: { 'content-type': 'application/json' }, body: '{not json' }))
+  check('非法 JSON → 400', badJson.statusCode === 400, String(badJson.statusCode))
+  check('400 的说明提到 JSON', /JSON/.test(badJson.body))
+
+  const badMode = await call(post('/custom-mode/state', { id: 'custom', mode: 'nope', prompt: 'x' }))
+  check('未知基础模式 → 400', badMode.statusCode === 400, String(badMode.statusCode))
+  check('400 的说明提到未知模式', /未知/.test(badMode.body), badMode.body.slice(0, 80))
+
+  const emptyPrompt = await call(post('/custom-mode/state', { id: 'custom', mode: 'standard', prompt: '   ' }))
+  check('空提示词 → 400', emptyPrompt.statusCode === 400, String(emptyPrompt.statusCode))
+  check('拒绝说明解释了为什么不能留空', /空/.test(emptyPrompt.body), emptyPrompt.body.slice(0, 80))
+
+  const before = readFileSync(promptPath, 'utf8')
+  const badVar = await call(post('/custom-mode/state', { id: 'custom', mode: 'standard', prompt: 'x {{foo}} y' }))
+  check('未注册的 {{变量}} → 400', badVar.statusCode === 400, String(badVar.statusCode))
+  check('被拒时文件未被改动', readFileSync(promptPath, 'utf8') === before)
+
+  const unknownId = await call(post('/custom-mode/state', { id: 'standard', mode: 'standard', prompt: 'x' }))
+  check('出厂模式不可被本工具改写 → 400', unknownId.statusCode === 400, String(unknownId.statusCode))
+
+  const longName = await call(post('/custom-mode/state', { id: 'custom', mode: 'standard', prompt: 'x', name: 'x'.repeat(200) }))
+  check('超长名称 → 400', longName.statusCode === 400, String(longName.statusCode))
+}
+
+console.log()
+console.log()
+console.log('=== 5.33 本线无法解析的行：报告 + 一键修复 ===')
+{
+  mounted = mount()
+  // 造一个"老版本留下来的"组成文件：启用了一行本机不存在的包（老版本播种会用另一条线的模板）。
+  const dir = dirname(editor.COMPOSITION_PATH)
+  const file = join(dir, 'agent.cordis.yml')
+  const base = readFileSync(file, 'utf8')
+  // 直接在末尾追加一个顶层行：保证一定写进文件（不依赖夹具里 persona 行的位置）。
+  writeFileSync(file, base + "\n- id: ghost-row\n  name: '@deepseek-ai/definitely-not-installed'\n", 'utf8')
+  check('夹具里确实多了一行虚构的包', readFileSync(file, 'utf8').includes('ghost-row'))
+
+  const state = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))).body)
+  check('state 报告"不可解析的行"', Array.isArray(state.unresolvable) && state.unresolvable.some((row) => row.id === 'ghost-row'), JSON.stringify(state.unresolvable))
+  check('并给出告警码（页面据此显示修复按钮）', (state.warnings ?? []).includes('unresolvableRows'), JSON.stringify(state.warnings))
+  check('state 带回插件版本（用户据此判断装到哪一版）', typeof state.version === 'string' && /^\d+\.\d+\.\d+$/.test(state.version), String(state.version))
+
+  const repaired = JSON.parse((await call(post('/custom-mode/repair', { id: 'custom' }))).body)
+  check('修复返回 code=repaired 与受影响的行', repaired.code === 'repaired' && String(repaired.params?.ids ?? '').includes('ghost-row'), JSON.stringify(repaired))
+  const afterText = readFileSync(file, 'utf8')
+  check('修复后那一行被显式关闭（disabled: true）', /- id: ghost-row[\s\S]{0,80}disabled: true/.test(afterText), afterText.slice(0, 200))
+  check('其它行没有被顺手改掉（persona 仍在）', afterText.includes('- id: persona'))
+  const state2 = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))).body)
+  check('修复后不再报警', (state2.warnings ?? []).includes('unresolvableRows') === false && state2.unresolvable.length === 0, JSON.stringify(state2.unresolvable))
+  const again = JSON.parse((await call(post('/custom-mode/repair', { id: 'custom' }))).body)
+  check('再点一次是幂等的（repairNotNeeded）', again.code === 'repairNotNeeded', JSON.stringify(again))
+}
+
+console.log()
+console.log('=== 5.35 并发与文案细节：串行化、显示名、闸门标记 ===')
+{
+  mounted = mount()
+  // 并发保存：审阅在 Windows 上实测 10 并发里有 1 次 EPERM。进程内按助手串行化后，同一助手的并发保存
+  // 不再互相踩；这里断言"全部 200"且磁盘内容是其中之一（不是混合状态）。
+  await call(post('/custom-mode/create', { name: '并发助手' }))
+  const ids = JSON.parse((await call(makeReq('GET', { url: '/custom-mode' }))).body).assistants.map((a) => a.id)
+  const concurrentId = ids[ids.length - 1]
+  const payloads = Array.from({ length: 10 }, (_, i) => `并发第 ${String(i)} 版\n`)
+  const responses = await Promise.all(payloads.map((prompt) => call(post('/custom-mode/state', { id: concurrentId, mode: 'standard', prompt }))))
+  const statuses = responses.map((response) => response.statusCode)
+  check('10 个并发保存全部成功（进程内按助手串行化）', statuses.every((status) => status === 200), JSON.stringify(statuses))
+  const onDisk = readFileSync(join(dirname(editor.COMPOSITION_PATH), '..', concurrentId, 'prompt.md'), 'utf8')
+  check('磁盘上是其中某一版，不是混合状态', payloads.includes(onDisk), JSON.stringify(onDisk))
+
+  // 复制/删除的文案用**显示名**，不是内部目录 id。
+  const copied = JSON.parse((await call(post('/custom-mode/create', { name: '复制体', from: concurrentId }))).body)
+  check('复制结果里的来源是显示名（不是 id）', copied.params?.from === '并发助手', JSON.stringify(copied.params))
+  const removed = JSON.parse((await call(post('/custom-mode/delete', { id: concurrentId }))).body)
+  check('删除结果里是显示名（不是 id）', removed.params?.name === '并发助手', JSON.stringify(removed.params))
+
+  // 审批闸门缺失时，页面拿到一个告警码（由预置侧的标记文件驱动）。
+  const markerDir = dirname(editor.COMPOSITION_PATH)
+  const marker = join(markerDir, 'approval-gate-missing')
+  writeFileSync(marker, 'test marker\n', 'utf8')
+  const withMarker = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))).body)
+  check('闸门缺失时回 approvalGateMissing 告警', (withMarker.warnings ?? []).includes('approvalGateMissing'), JSON.stringify(withMarker.warnings))
+  rmSync(marker, { force: true })
+  const withoutMarker = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))).body)
+  check('标记清掉后告警消失', (withoutMarker.warnings ?? []).includes('approvalGateMissing') === false, JSON.stringify(withoutMarker.warnings))
+}
+
+console.log()
+console.log('=== 5.31 请求体上限：chunked（没有 content-length）也不能绕过 ===')
+{
+  mounted = mount()
+  // 只信 content-length 的检查会被流式请求绕过；这里用 ReadableStream 发一个超过上限的体。
+  const big = new TextEncoder().encode(JSON.stringify({ id: 'custom', mode: 'standard', prompt: 'x'.repeat(4 * 1024 * 1024 + 64) }))
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(big)
+      controller.close()
+    },
+  })
+  const response = await call({ method: 'POST', url: '/custom-mode/state', headers: { 'content-type': 'application/json' }, body: stream, duplex: 'half' })
+  check('流式超大体被拒（413），而不是靠 content-length 头', response.statusCode === 413, `${String(response.statusCode)} ${response.body.slice(0, 80)}`)
+  check('拒绝原因回 code=bodyTooLarge', /bodyTooLarge/.test(response.body), response.body.slice(0, 120))
+}
+
+console.log()
+console.log('=== 5.4 服务端回 code：页面按语言渲染，不再混排 ===')
+{
+  mounted = mount()
+  // 成功路径：保存 → code=saved + params（显示名、基础模式）
+  const savedCode = JSON.parse((await call(post('/custom-mode/state', { id: 'custom', mode: 'standard', prompt: '代码测试\n', name: '写作助手' }))).body)
+  check('保存回 code=saved', savedCode.code === 'saved', JSON.stringify({ code: savedCode.code }))
+  check('params 带显示名与基础模式', savedCode.params?.name === '写作助手' && savedCode.params?.mode === 'standard', JSON.stringify(savedCode.params))
+  // 失败路径：空提示词 → promptEmpty；名字过长 → nameTooLong（带 max）
+  const empty = JSON.parse((await call(post('/custom-mode/state', { id: 'custom', mode: 'standard', prompt: '   ' }))).body)
+  check('空提示词回 promptEmpty', empty.code === 'promptEmpty', JSON.stringify({ code: empty.code }))
+  const tooLong = JSON.parse((await call(post('/custom-mode/state', { id: 'custom', mode: 'standard', prompt: 'x', name: 'n'.repeat(200) }))).body)
+  check('超长名字回 nameTooLong 且带上限', tooLong.code === 'nameTooLong' && typeof tooLong.params?.max === 'number', JSON.stringify(tooLong.params))
+  // 中文串保留（HTTP API 的兼容面）——新客户端按 code 渲染，旧调用方仍拿到可读文案。
+  check('中文文案仍然保留（兼容）', typeof empty.error === 'string' && empty.error.includes('系统提示词为空'), String(empty.error).slice(0, 40))
+}
+
+console.log()
+console.log('=== 5.5 改动历史：谁改过、能不能取回 ===')
+{
+  mounted = mount()
+  // 保存一版 → 历史上必须有它。
+  const saved = await call(post('/custom-mode/state', { id: 'custom', mode: 'standard', prompt: '历史第一版\n' }))
+  check('保存成功（准备阶段）', saved.statusCode === 200, saved.body.slice(0, 80))
+
+  const withHistory = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))).body)
+  check('state 带历史列表', Array.isArray(withHistory.history) && withHistory.history.length >= 1, JSON.stringify(withHistory.history?.length))
+  const newest = withHistory.history[0]
+  check('历史项带序号/时间/来源/预览', Number.isInteger(newest?.n) && typeof newest.at === 'string' && newest.by === 'settings' && newest.preview === '历史第一版', JSON.stringify(newest))
+  check('历史列表不带正文（正文按需取）', newest.text === undefined)
+
+  const version = JSON.parse((await call(makeReq('GET', { url: `/custom-mode/history?id=custom&n=${String(newest.n)}` }))).body)
+  check('按序号取回该版正文', version.ok === true && version.text === '历史第一版\n', JSON.stringify(version).slice(0, 80))
+
+  const missing = await call(makeReq('GET', { url: '/custom-mode/history?id=custom&n=99999' }))
+  check('未知序号 → 404', missing.statusCode === 404, String(missing.statusCode))
+  const unknownId = await call(makeReq('GET', { url: '/custom-mode/history?id=nope&n=1' }))
+  check('未知助手 → 404', unknownId.statusCode === 404, String(unknownId.statusCode))
+
+  // 会话内的工具（或手工编辑）直接改盘：下次读状态必须补记一条 external，
+  // 否则"提示词被改过"这件事对用户永远不可见 —— 这正是这个功能存在的理由。
+  writeFileSync(promptPath, '会话内工具改的\n', 'utf8')
+  const afterExternal = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))).body)
+  const external = afterExternal.history[0]
+  check('设置页之外的改动被记成 external', external.by === 'external' && external.preview === '会话内工具改的', JSON.stringify(external))
+  check('旧版本仍在历史里（只追加）', afterExternal.history.some((entry) => entry.preview === '历史第一版'), JSON.stringify(afterExternal.history.map((e) => e.preview)))
+  check('再读一次不会重复记（文本没变）', JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))).body).history.length === afterExternal.history.length)
+}
+
+console.log('=== 6. POST /custom-mode/create：从模板建一个助手 ===')
+{
+  mounted = mount()
+  const empty = await call(post('/custom-mode/create', { name: '   ' }))
+  check('空名字 → 400', empty.statusCode === 400, String(empty.statusCode))
+  check('空名字的说明要用户起名', /名字/.test(empty.body), empty.body.slice(0, 80))
+
+  const created = await call(post('/custom-mode/create', { name: '写作助手', description: '写文档' }))
+  check('创建返回 200', created.statusCode === 200, `${created.statusCode} ${created.body.slice(0, 80)}`)
+  const body = JSON.parse(created.body)
+  check('中文名回落到 custom-2（custom 已被占用）', body.id === 'custom-2', String(body.id))
+  const createdDir = join(userRoot, 'custom-2')
+  check('目录已建立', existsSync(createdDir))
+  for (const name of ['agent.cordis.yml', 'prompt.md', 'prompt-reader.mjs', 'prompt-tool.mjs', 'preset.yml']) {
+    check(`模板文件就位：${name}`, existsSync(join(createdDir, name)))
+  }
+  const createdMeta = readFileSync(join(createdDir, 'preset.yml'), 'utf8')
+  check('preset.yml 带上了名字', createdMeta.includes('name: "写作助手"'), JSON.stringify(createdMeta))
+  check('preset.yml 带上了描述', createdMeta.includes('description: "写文档"'), JSON.stringify(createdMeta))
+  const createdComposition = readFileSync(join(createdDir, 'agent.cordis.yml'), 'utf8')
+  check('新助手的组成文件是 standard 底子', /^# 基础模式: standard$/m.test(createdComposition))
+  check('新助手的 custom_prompt 行认识自己', /modeName: "写作助手"/.test(createdComposition))
+  check('新助手出现在列表接口里', JSON.parse((await call(makeReq('GET', { url: '/custom-mode' }))).body).assistants.some((item) => item.id === 'custom-2'))
+
+  // 名字本身是合法 id 时就用它，目录名可读。
+  const latin = await call(post('/custom-mode/create', { name: 'Writer' }))
+  check('英文名直接用作用户目录名', JSON.parse(latin.body).id === 'writer', latin.body.slice(0, 80))
+
+  const clash = await call(post('/custom-mode/create', { name: 'Writer' }))
+  check('重名不覆盖：换一个可用 id', clash.statusCode === 200 && JSON.parse(clash.body).id === 'writer-2', clash.body.slice(0, 90))
+
+  // 必须能真的被读到（新会话就是这样拿到它的）
+  const opened = await call(makeReq('GET', { url: '/custom-mode/state?id=custom-2' }))
+  check('新助手可被读取', JSON.parse(opened.body).ok === true, opened.body.slice(0, 90))
+
+  // ── 复制：源是第 5 节保存过的 custom（非默认提示词 + 非空开关）──────────────
+  const sourceState = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))).body)
+  const duplicated = await call(post('/custom-mode/create', { name: '测试副本', from: 'custom' }))
+  check('复制返回 200', duplicated.statusCode === 200 && JSON.parse(duplicated.body).ok === true, duplicated.body.slice(0, 90))
+  const dupId = JSON.parse(duplicated.body).id
+  check('复制体拿到新 id（不与源同目录）', dupId !== 'custom' && dupId !== undefined, String(dupId))
+  const dupState = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=' + dupId }))).body)
+  check('复制来的提示词与源逐字一致', dupState.prompt === sourceState.prompt, JSON.stringify([dupState.prompt, sourceState.prompt]))
+  check('复制来的基础模式与源一致', dupState.mode === sourceState.mode, `${dupState.mode} vs ${sourceState.mode}`)
+  check(
+    '复制来的行开关与源一致',
+    JSON.stringify(dupState.overrides) === JSON.stringify(sourceState.overrides),
+    `${JSON.stringify(dupState.overrides)} vs ${JSON.stringify(sourceState.overrides)}`,
+  )
+  check('复制体是两个独立文件', dupState.promptPath !== sourceState.promptPath)
+  check('复制体的组成文件报的是自己的名字', /^# 助手: 测试副本 \(/m.test(readFileSync(dupState.compositionPath, 'utf8')), dupState.compositionPath)
+
+  const badFrom = await call(post('/custom-mode/create', { name: 'X', from: 'nope' }))
+  check('源不存在时拒绝复制 → 400', badFrom.statusCode === 400, String(badFrom.statusCode))
+}
+
+console.log()
+console.log('=== 7. POST /custom-mode/reorder：顺序即 roster 的 order ===')
+{
+  mounted = mount()
+  const before = JSON.parse((await call(makeReq('GET', { url: '/custom-mode' }))).body).assistants.map((item) => item.id)
+  check('排序前已有多个助手', before.length >= 3, JSON.stringify(before))
+
+  const second = before[1]
+  const moved = await call(post('/custom-mode/reorder', { id: second, direction: 'up' }))
+  check('上移返回 200', moved.statusCode === 200 && JSON.parse(moved.body).ok === true, moved.body.slice(0, 90))
+  const after = JSON.parse((await call(makeReq('GET', { url: '/custom-mode' }))).body).assistants.map((item) => item.id)
+  check('列表顺序真的变了（前两名互换）', after[0] === second && after[1] === before[0], JSON.stringify({ before, after }))
+  check(
+    'order 落在 preset.yml 里（重启后仍然生效，不靠插件自己的状态）',
+    /^order: 1$/m.test(readFileSync(join(userRoot, second, 'preset.yml'), 'utf8')),
+    readFileSync(join(userRoot, second, 'preset.yml'), 'utf8'),
+  )
+
+  const atTop = await call(post('/custom-mode/reorder', { id: after[0], direction: 'up' }))
+  check('已是最前再上移 → 400', atTop.statusCode === 400, String(atTop.statusCode))
+  const unknown = await call(post('/custom-mode/reorder', { id: 'nope', direction: 'up' }))
+  check('未知 id → 400', unknown.statusCode === 400, String(unknown.statusCode))
+  const badDirection = await call(post('/custom-mode/reorder', { id: second, direction: 'sideways' }))
+  check('未知方向 → 400', badDirection.statusCode === 400, String(badDirection.statusCode))
+
+  const callsBefore = handlerCalls
+  const getReorder = await call(makeReq('GET', { url: '/custom-mode/reorder' }))
+  check(
+    'GET reorder → 404，且根本没进 handler（顺序不能被预取链接改动）',
+    getReorder.statusCode === 404 && handlerCalls === callsBefore,
+    `${getReorder.statusCode} handlerCalls=${handlerCalls - callsBefore}`,
+  )
+}
+
+console.log()
+console.log('=== 8. POST /custom-mode/delete：只能删自己管理的模式 ===')
+{
+  mounted = mount()
+  const system = await call(post('/custom-mode/delete', { id: 'standard' }))
+  check('删出厂模式 → 400', system.statusCode === 400, String(system.statusCode))
+  check('说明里点出「找不到助手」而不是笼统失败', /找不到助手/.test(system.body), system.body.slice(0, 90))
+
+  const unknown = await call(post('/custom-mode/delete', { id: 'nope' }))
+  check('删不存在的 → 400', unknown.statusCode === 400, String(unknown.statusCode))
+
+  const removed = await call(post('/custom-mode/delete', { id: 'writer' }))
+  check('删除自己创建的 → 200', removed.statusCode === 200, `${removed.statusCode} ${removed.body.slice(0, 80)}`)
+  check('目录真的没了', !existsSync(join(userRoot, 'writer')))
+  check('列表里也没了', !JSON.parse((await call(makeReq('GET', { url: '/custom-mode' }))).body).assistants.some((item) => item.id === 'writer'))
+  check('其它助手不受影响', existsSync(join(userRoot, 'custom-2')))
+}
+
+console.log()
+console.log('=== 6b. 姿态只是起点，底子仍是官方预设 ===')
+{
+  mounted = mount()
+  const list = JSON.parse((await call(makeReq('GET', { url: '/custom-mode' }))).body)
+  const ids = (list.postures || []).map((item) => item.id)
+  check('列表公开三种姿态', ids.join(',') === 'develop,write,chat', JSON.stringify(ids))
+  const official = new Set(['standard', 'ptc', 'minimal', 'cordis', 'all'])
+  check(
+    '每种姿态的 base 都是官方预设',
+    Array.isArray(list.postures) && list.postures.every((item) => official.has(item.base)),
+    JSON.stringify(list.postures),
+  )
+
+  const factory = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'preset', 'prompt.md'), 'utf8')
+  const developed = JSON.parse((await call(post('/custom-mode/create', { name: 'Posture Dev', posture: 'develop' }))).body)
+  check('develop 创建成功', developed.ok === true, JSON.stringify(developed).slice(0, 120))
+  const devState = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=' + developed.id }))).body)
+  check('develop 与不带姿态一样用出厂提示词', devState.prompt === factory, String(devState.prompt).slice(0, 60))
+  check('develop 的底是 standard', devState.mode === 'standard', devState.mode)
+  check('develop 不把 bash 写成开', devState.overrides['tool-bash'] !== true)
+
+  const chatted = JSON.parse((await call(post('/custom-mode/create', { name: 'Posture Chat', posture: 'chat', locale: 'en' }))).body)
+  const chatState = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=' + chatted.id }))).body)
+  check('聊天姿态的底仍是 standard', chatState.mode === 'standard', chatState.mode)
+  check('聊天关掉出厂开启的 tool-web', chatState.overrides['tool-web'] === false, JSON.stringify(chatState.overrides))
+  check('聊天不把 persona 关掉', chatState.overrides.persona !== false)
+  check('聊天用英文起步提示词', typeof chatState.prompt === 'string' && chatState.prompt.includes('conversation partner'), String(chatState.prompt).slice(0, 80))
+
+  const written = JSON.parse((await call(post('/custom-mode/create', { name: 'Posture Write', posture: 'write', locale: 'zh-CN' }))).body)
+  const writeState = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=' + written.id }))).body)
+  check('写作姿态的底仍是 standard', writeState.mode === 'standard', writeState.mode)
+  check('写作关掉 tool-web', writeState.overrides['tool-web'] === false)
+  check('写作用中文起步提示词', typeof writeState.prompt === 'string' && writeState.prompt.includes('只改用户点名的文件'), String(writeState.prompt).slice(0, 40))
+  check('写作的恢复出厂就是新建时那一份', writeState.factoryPrompt === writeState.prompt, String(writeState.factoryPrompt).slice(0, 40))
+  check('起步稿落在助手目录里', existsSync(join(userRoot, written.id, 'prompt.starter.md')))
+  const changed = await call(post('/custom-mode/state', {
+    id: written.id,
+    mode: 'standard',
+    prompt: '改过的写作稿\n',
+    overrides: writeState.overrides,
+  }))
+  check('改写提示词成功', JSON.parse(changed.body).ok === true, changed.body.slice(0, 120))
+  const afterEdit = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=' + written.id }))).body)
+  check('后来的保存不改写起步稿', afterEdit.prompt.includes('改过的写作稿') && afterEdit.factoryPrompt === writeState.prompt)
+
+  const unknown = await call(post('/custom-mode/create', { name: 'Nope Posture', posture: 'tavern' }))
+  check('未知姿态 → 400 postureUnknown', unknown.statusCode === 400 && JSON.parse(unknown.body).code === 'postureUnknown', unknown.body.slice(0, 140))
+  check('未知姿态不留下目录', !existsSync(join(userRoot, 'nope-posture')) && !existsSync(join(userRoot, 'tavern')))
+}
+
+console.log()
+console.log('=== 9. 方法与子路径 ===')
+{
+  mounted = mount()
+  const put = await call(makeReq('PUT', {}))
+  check('PUT → 404（该方法未声明，到不了 handler）', put.statusCode === 404, String(put.statusCode))
+  check('未声明的方法返回空体（不是我们的 400/405 —— 根本没进 handler）', put.body === '', JSON.stringify(put.body))
+
+  const getCreate = await call(makeReq('GET', { url: '/custom-mode/create' }))
+  check('GET create → 404（预设抓取不能建助手）', getCreate.statusCode === 404, String(getCreate.statusCode))
+  check('create 目录未被创建', !existsSync(join(userRoot, 'get-create')))
+
+  const getDelete = await call(makeReq('GET', { url: '/custom-mode/delete' }))
+  check('GET delete → 404', getDelete.statusCode === 404, String(getDelete.statusCode))
+
+  const deep = await call(makeReq('GET', { url: '/custom-mode/whatever' }))
+  check('未知子路径 → 404', deep.statusCode === 404, String(deep.statusCode))
+
+  const sibling = await call(makeReq('GET', { url: '/custom-mode-other' }))
+  check('前缀不吞掉兄弟路径之外的东西（仍归本路由，但子路径未知）', sibling.statusCode === 404, String(sibling.statusCode))
+}
+
+console.log()
+console.log('=== 10. 其他异常输入 ===')
+{
+  mounted = mount()
+  // 请求体上限不再由我们实现：`requestBody: 'buffered'` 的语义是"遵循平台配置的 JSON 上限"，
+  // 超限由载体在分发前拒绝（§1 已断言每条路由都声明了 buffered）。这里只确认小体量解析正常。
+  const parsedOk = await call(post('/custom-mode/state', { id: 'custom', mode: 'standard', prompt: 'ok' }))
+  check('正常体量仍然解析成功', parsedOk.statusCode === 200, String(parsedOk.statusCode))
+
+  const undefinedMode = await call(post('/custom-mode/state', { id: 'custom', prompt: 'x' }))
+  check('缺少 mode → 400（不崩）', undefinedMode.statusCode === 400, String(undefinedMode.statusCode))
+
+  const notObject = await call(makeReq('POST', { url: '/custom-mode/state', headers: {}, body: '"just a string"' }))
+  check('请求体是字符串而不是对象 → 400（不崩）', notObject.statusCode === 400, String(notObject.statusCode))
+}
+
+console.log()
+console.log('=== 11. 缺文件时的行为（不能崩） ===')
+{
+  // 注意顺序：`apply()` 现在会补全 preset 里缺失的模板文件，所以"文件不见了"这个场景
+  // 必须是**激活之后**才发生的——删在前会被补回来。
+  const saved = readFileSync(compositionPath, 'utf8')
+  mounted = mount()
+  rmSync(compositionPath, { force: true })
+  const res = await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))
+  check('缺组合文件 → 200 且 ok:false + 明确错误', res.statusCode === 200 && JSON.parse(res.body).ok === false, res.body.slice(0, 90))
+  check('缺文件时说明是哪个文件', String(JSON.parse(res.body).error).includes(compositionPath), res.body.slice(0, 140))
+  writeFileSync(compositionPath, saved, 'utf8')
+}
+
+console.log()
+console.log('=== 12. 每个用户可见的结果都带 code，且每个 code 都有中英词典 ===')
+{
+  /**
+   * 为什么这一节存在："英文界面在出错那一刻掉回中文"是本项目被外部审阅点名的硬伤，纪律写在
+   * AGENTS.md 第 13 条 —— 宿主半的每个用户可见结果都要带 `code`，页面拿 `code` 查自己的词典。
+   * 这一轮抓到的两处漏网都只在"那条分支真的被走到"时才现形，单元测试看不见：
+   *   - `create` 路径的渲染失败返回漏了 `code`（英文界面直接显示宿主的中文串）；
+   *   - `bodyTooLarge` / `repaired` / `repairNotNeeded` 三个 code 在词典里**根本没有条目**
+   *     （查不到同样退回宿主文案）。
+   * 所以这里对着**源码**断言，与"源里不得出现 webServer.register"是同一手法。client.js 那份
+   * 手抄词典由 locales.test.mjs 与 locales.mjs 逐条比对，因此不必在这里重复。
+   */
+  const localesSource = readFileSync(new URL('../locales.mjs', import.meta.url), 'utf8')
+
+  /**
+   * 把字符串与注释替换成等长空白（保留换行，下标不变），只留可判定的代码。
+   *
+   * **必须单遍扫描**：先前的写法是"先用正则剥字符串、再剥注释"，而英文注释里的撇号（`user's`）
+   * 会和后面真正的引号错配，把中间一大段（包括 `unknownAssistant` 的整个函数体）吞成空白 ——
+   * 守卫于是漏掉了一处真实的漏网 code。这类正则的失效方式正是"安静地少检查"。
+   */
+  const blankNonCode = (source) => {
+    const out = source.split('')
+    const n = source.length
+    const blank = (from, to) => {
+      for (let k = from; k < to && k < n; k += 1) if (out[k] !== '\n') out[k] = ' '
+    }
+    let i = 0
+    while (i < n) {
+      const ch = source[i]
+      const next = source[i + 1]
+      if (ch === '/' && next === '/') {
+        const end = source.indexOf('\n', i)
+        const stop = end === -1 ? n : end
+        blank(i, stop)
+        i = stop
+        continue
+      }
+      if (ch === '/' && next === '*') {
+        const end = source.indexOf('*/', i + 2)
+        const stop = end === -1 ? n : end + 2
+        blank(i, stop)
+        i = stop
+        continue
+      }
+      if (ch === "'" || ch === '"' || ch === '`') {
+        let j = i + 1
+        while (j < n) {
+          if (source[j] === '\\') { j += 2; continue }
+          if (source[j] === ch) { j += 1; break }
+          j += 1
+        }
+        blank(i, j)
+        i = j
+        continue
+      }
+      i += 1
+    }
+    return out.join('')
+  }
+
+  /** `ok: false` 所在的对象字面量的下标范围：向前找最近的未配对 `{`，再配到它的 `}`。 */
+  const enclosingLiteralRange = (source, at) => {
+    let depth = 0
+    for (let i = at; i >= 0; i -= 1) {
+      if (source[i] === '}') depth += 1
+      else if (source[i] === '{') {
+        if (depth === 0) {
+          let forward = 0
+          for (let j = i; j < source.length; j += 1) {
+            if (source[j] === '{') forward += 1
+            else if (source[j] === '}') {
+              forward -= 1
+              if (forward === 0) return [i, j + 1]
+            }
+          }
+          return null
+        }
+        depth -= 1
+      }
+    }
+    return null
+  }
+
+  // **每个宿主模块都要扫**，不只 index.mjs：这一轮真实漏网的五处里，四处来自 assistants.mjs
+  // （创建路径的四个失败返回），只扫 index.mjs 会让它们全部溜过去。locales.mjs 是词典、
+  // client.js 是浏览器半，都不在这里的范围内。
+  const hostModules = readdirSync(new URL('..', import.meta.url))
+    .filter((name) => name.endsWith('.mjs') && name !== 'locales.mjs')
+
+  const naked = []
+  const missing = []
+  for (const moduleName of hostModules) {
+    const hostSource = readFileSync(new URL(`../${moduleName}`, import.meta.url), 'utf8')
+    const blank = blankNonCode(hostSource)
+
+    for (const hit of blank.matchAll(/ok:\s*false/g)) {
+      const range = enclosingLiteralRange(blank, hit.index)
+      // 诊断用**原文**切片（blank 版把字符串抹成了空白，报错会看不懂），判定仍看 blank 版。
+      if (range !== null && !/\bcode:/.test(blank.slice(range[0], range[1]))) {
+        const line = hostSource.slice(0, hit.index).split('\n').length
+        naked.push(`${moduleName}:${String(line)} ${hostSource.slice(range[0], range[1]).replace(/\s+/g, ' ').trim().slice(0, 70)}`)
+      }
+    }
+
+    for (const m of hostSource.matchAll(/code:\s*([^,}\n]+)/g)) {
+      for (const s of m[1].matchAll(/'([A-Za-z][A-Za-z0-9]*)'/g)) {
+        // 中英各一条：`'api.x':` 在 locales.mjs 里必须恰好出现两次（多的那次是重复键）。
+        const twice = localesSource.split(`'api.${s[1]}':`).length - 1
+        if (twice !== 2) missing.push(`${moduleName}: ${s[1]}(${twice})`)
+      }
+    }
+  }
+  check(`宿主半每个模块的 ok: false 都带 code（扫了 ${String(hostModules.length)} 个）`, naked.length === 0, naked.join(' | '))
+  check('每个 code 在 locales.mjs 里都有中英两条', missing.length === 0, missing.join(', '))
+}
+
+console.log()
+console.log('=== 8b. 自动互斥：两套壳不能同时启用（否则预设被判 broken，并从选择器里静默消失）===')
+{
+  // 实测依据（2026-10-01，dsh 0.2.0-rc.2 真启动 + 读实例自己的 `/api/custom-mode`）：
+  //
+  //   broken = "persistent-bash (@deepseek-ai/dsh-tool-bash-persistent):
+  //             tool \"bash\" is already registered in this scope"
+  //
+  // 而 broken 的预设被从**所有**选择器里丢掉、设置页却全绿（`ok:true` / `warnings:[]`）。
+  // 所以保存路径必须**替用户避让**，并把动过哪一行如实说出来 —— 而不是让他事后面对一个消失的模式。
+  const rowBlock = (text, id) => {
+    const i = text.indexOf('- id: ' + id)
+    const j = text.indexOf('- id: ', i + 6)
+    return j === -1 ? text.slice(i) : text.slice(i, j)
+  }
+  const off = (text, id) => /disabled: true/.test(rowBlock(text, id))
+
+  // ★ 期望值必须**从本平台的真实状态算出来**，不能写死 `tool-bash`：夹具里那两行带
+  //   `disabled: !!js process.platform === 'win32'`，在 Windows 上本来就关着 —— 写死它会让
+  //   这一节只在 Linux 上绿。**CI 的 windows 腿就是这么红的**（2026-10-01 实测：code 变成 `saved`、
+  //   磁盘断言指着一行根本没被碰过的行）。真正的不变量是"当前开着的那一侧要让开"，与平台无关。
+  const unionFlat = []
+  const walkUnion = (rows) => {
+    for (const row of rows) {
+      unionFlat.push(row)
+      walkUnion(row.children ?? [])
+    }
+  }
+  walkUnion(collectRows(renderComposition('all', new Map())))
+  const isOn = (id) => unionFlat.find((row) => row.id === id)?.disabled !== true
+  const stdShellsOn = ['tool-bash', 'tool-pwsh'].filter((id) => isOn(id))
+  check('夹具就位：标准壳那一侧在本平台至少有一行开着', stdShellsOn.length > 0, `开机行=${JSON.stringify(stdShellsOn)}`)
+
+  const first = JSON.parse(
+    (await call(post('/custom-mode/state', { id: 'custom', mode: 'all', prompt: '并集\n', overrides: { 'persistent-shell': true } }))).body,
+  )
+  check('打开另一套壳时保存仍然成功（不是报错）', first.ok === true, String(first.error ?? ''))
+  check('用专门的 code 说明动过开关', first.code === 'savedWithExclusiveRows', String(first.code))
+  check(
+    'params 点名被关掉的行',
+    typeof first.params?.rows === 'string' && stdShellsOn.some((id) => first.params.rows.includes(id)),
+    `${JSON.stringify(first.params)} 期望含 ${JSON.stringify(stdShellsOn)}`,
+  )
+  const afterAuto = readFileSync(compositionPath, 'utf8')
+  check(
+    '标准壳那一侧开着的行被真的关掉（磁盘真值）',
+    stdShellsOn.every((id) => off(afterAuto, id)),
+    `期望关掉 ${JSON.stringify(stdShellsOn)} / ${rowBlock(afterAuto, stdShellsOn[0] ?? 'tool-bash').slice(0, 70)}`,
+  )
+  check('用户要的那一侧留着开着', off(afterAuto, 'persistent-shell') === false, rowBlock(afterAuto, 'persistent-shell').slice(0, 70))
+  const stateAfter = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))).body)
+  check('避让之后不应再有互斥告警', stateAfter.warnings.includes('exclusiveRowsActive') === false, JSON.stringify(stateAfter.warnings))
+
+  // 两边都在同一次请求里显式打开：没有"用户要的那一侧"可认 ⇒ 退回避让 `unionDefaultOff` 的那一侧。
+  const both = JSON.parse(
+    (await call(post('/custom-mode/state', { id: 'custom', mode: 'all', prompt: '并集\n', overrides: { 'persistent-shell': true, 'tool-bash': true, 'tool-pwsh': true } }))).body,
+  )
+  check('两边都要时也只留一侧', both.code === 'savedWithExclusiveRows', String(both.code))
+  check('两边都要时保留出厂偏好的那一侧', off(readFileSync(compositionPath, 'utf8'), 'persistent-shell') === true, rowBlock(readFileSync(compositionPath, 'utf8'), 'persistent-shell').slice(0, 70))
+
+  // 页面**之外**写进去的互斥组合（手工编辑、别的工具、直接调 API）：必须被点名，而不是沉默。
+  // 保存路径已经会避让，所以这条只由"不是本页写的"文件命中。
+  writeFileSync(
+    compositionPath,
+    renderComposition('all', new Map([['persistent-shell', true], ['tool-bash', true], ['tool-pwsh', true]]), { modeName: '并集探针', assistantId: 'custom' }),
+    'utf8',
+  )
+  const illegal = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))).body)
+  check('页面外写进去的互斥组合会被点名', illegal.warnings.includes('exclusiveRowsActive'), JSON.stringify(illegal.warnings))
+}
+
+console.log()
+console.log('=== 8c. 宿主报的 broken 必须被点名、被修复（桌面端实测：只修「装不上」会留下死局）===')
+{
+  // 实测依据（2026-10-01，官方桌面端 0.2.0-rc.2，真机）：
+  //   修掉装不上的引擎行之后，`unresolvable` 变空、页面**全绿**，而预设**仍然 broken** ——
+  //   依赖引擎的两个工具在等它（"waiting for workflowEngine"）。用户以为修好了，模式却始终
+  //   不出现在选择器里。⇒ 必须把宿主给的 `broken` 也变成页面上的一句话，并让修复认它。
+  check('brokenRowIds 抠出行 id', JSON.stringify(editor.brokenRowIds('a (@m/x): never started\nb (@m/y): waiting for e')) === '["a","b"]', JSON.stringify(editor.brokenRowIds('a (@m/x): never started\nb (@m/y): waiting for e')))
+  check('brokenRowIds 去重且保序', JSON.stringify(editor.brokenRowIds('a (@m): 1\na (@m): 2')) === '["a"]', '')
+  check('brokenRowIds 对非字符串/认不出的给空数组', editor.brokenRowIds(null).length === 0 && editor.brokenRowIds('随便一句话').length === 0, JSON.stringify(editor.brokenRowIds('随便一句话')))
+
+  const hostRows = (broken) => [{ id: 'custom', trust: 'user', path: compositionPath, name: '自定义模式', broken }]
+  const brokenMsg = 'tool-workflow (@deepseek-ai/dsh-tool-workflow): waiting for workflowEngine'
+
+  const st = editor.readState(hostRows(brokenMsg), 'custom', {})
+  check('宿主报 broken 且我们自己解释不了 → 点名 presetBroken', st.warnings.includes('presetBroken'), JSON.stringify(st.warnings))
+  check('broken 原文透传给页面（详情里能看见）', st.broken === brokenMsg, String(st.broken))
+
+  const notParsed = editor.readState(hostRows('平台换了个措辞，认不出行 id'), 'custom', {})
+  check('认不出行 id 时也照样点名（宁可笼统，不可沉默）', notParsed.warnings.includes('presetBroken'), JSON.stringify(notParsed.warnings))
+
+  const clean = editor.readState(hostRows(undefined), 'custom', {})
+  check('宿主没说坏时不误报', clean.warnings.includes('presetBroken') === false && clean.broken === null, JSON.stringify(clean.warnings))
+
+  // 修复必须**认宿主点名的行**，而不只是我们自己查得到的"装不上"的行。
+  writeFileSync(compositionPath, renderComposition('standard', new Map()), 'utf8')
+  const block = (text, id) => (text.split('- id: ' + id)[1] ?? '').split('- id: ')[0]
+  check('夹具就位：tool-web 开着', /disabled: true/.test(block(readFileSync(compositionPath, 'utf8'), 'tool-web')) === false, block(readFileSync(compositionPath, 'utf8'), 'tool-web').slice(0, 50))
+
+  const repaired = editor.repairComposition(hostRows('tool-web (@deepseek-ai/dsh-tool-web): never started'), { id: 'custom' })
+  check('宿主点名的行被修复关掉', repaired.ok === true && repaired.code === 'repaired' && repaired.params.repairedIds.includes('tool-web'), JSON.stringify(repaired.params ?? repaired))
+  check('磁盘上真的关掉了', /disabled: true/.test(block(readFileSync(compositionPath, 'utf8'), 'tool-web')), block(readFileSync(compositionPath, 'utf8'), 'tool-web').slice(0, 60))
+  const nothing = editor.repairComposition(hostRows('nope (@x/y): never started'), { id: 'custom' })
+  check('宿主报的行不在文本里时不虚报计数', nothing.code === 'repairNotNeeded', JSON.stringify(nothing.params ?? nothing))
+
+  // 列表里带上"是哪几行"，页面才能把标签写成「N 行在本机不可用」而不是笼统的「有问题」。
+  const listed = editor.readList([
+    { id: 'custom', trust: 'user', path: compositionPath, name: '自定义模式', broken: brokenMsg },
+    { id: 'writer', trust: 'user', path: compositionPath, name: 'Writer' },
+  ])
+  const customItem = listed.assistants.find((item) => item.id === 'custom')
+  check('列表带出 brokenRows（页面据此显示具体行数）', JSON.stringify(customItem.brokenRows) === JSON.stringify(['tool-workflow']), JSON.stringify(customItem.brokenRows))
+  check('没坏的那些助手不带这个字段', listed.assistants.find((item) => item.id === 'writer').brokenRows === undefined, JSON.stringify(listed.assistants.find((item) => item.id === 'writer')))
+}
+
+console.log()
+console.log('=== 5.6 陈旧保存：过期 baseN 拒绝写入，不带 baseN 只记历史 ===')
+{
+  mounted = mount()
+  const baseline = await call(post('/custom-mode/state', { id: 'custom', mode: 'standard', prompt: '页面基线\n', name: '自定义模式' }))
+  check('基线保存 200', baseline.statusCode === 200, baseline.body.slice(0, 120))
+  const opened = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))).body)
+  const baseN = opened.history[0]?.n
+  check('历史最新一条在数组前面，序号是数字', typeof baseN === 'number', JSON.stringify(opened.history?.[0]))
+
+  writeFileSync(promptPath, 'EXTERNAL-EDIT-B\n', 'utf8')
+  const conflict = await call(post('/custom-mode/state', {
+    id: 'custom',
+    mode: 'standard',
+    prompt: 'STALE-PAGE-EDIT-A\n',
+    name: '自定义模式',
+    baseN,
+  }))
+  const conflictBody = JSON.parse(conflict.body)
+  check(
+    '过期 baseN → 400 conflict',
+    conflict.statusCode === 400 && conflictBody.ok === false && conflictBody.code === 'conflict',
+    `${String(conflict.statusCode)} ${conflict.body.slice(0, 160)}`,
+  )
+  check('冲突时 prompt.md 仍是外部文本', readFileSync(promptPath, 'utf8') === 'EXTERNAL-EDIT-B\n', JSON.stringify(readFileSync(promptPath, 'utf8')))
+  const afterConflict = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))).body)
+  const externalB = afterConflict.history.find((entry) => entry.preview === 'EXTERNAL-EDIT-B')
+  check('冲突把外部文本记成 external', externalB !== undefined && externalB.by === 'external', JSON.stringify(afterConflict.history.map((entry) => entry.preview)))
+  const fetchedB = externalB === undefined
+    ? { ok: false }
+    : JSON.parse((await call(makeReq('GET', { url: `/custom-mode/history?id=custom&n=${String(externalB.n)}` }))).body)
+  check('能按序号取回外部文本', fetchedB.ok === true && fetchedB.text === 'EXTERNAL-EDIT-B\n', JSON.stringify(fetchedB).slice(0, 100))
+
+  const omitted = await call(post('/custom-mode/state', {
+    id: 'custom',
+    mode: 'standard',
+    prompt: 'STALE-PAGE-EDIT-A\n',
+    name: '自定义模式',
+  }))
+  check('不带 baseN 仍是 200', omitted.statusCode === 200 && JSON.parse(omitted.body).ok === true, omitted.body.slice(0, 120))
+  check('不带 baseN 时磁盘变成页面文本', readFileSync(promptPath, 'utf8') === 'STALE-PAGE-EDIT-A\n', JSON.stringify(readFileSync(promptPath, 'utf8')))
+  const afterOmit = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))).body)
+  check('不带 baseN 时历史里仍有外部文本', afterOmit.history.some((entry) => entry.preview === 'EXTERNAL-EDIT-B'), JSON.stringify(afterOmit.history.map((entry) => entry.preview)))
+
+  writeFileSync(promptPath, 'EXTERNAL-EDIT-C\n', 'utf8')
+  const asString = await call(post('/custom-mode/state', {
+    id: 'custom',
+    mode: 'standard',
+    prompt: 'STALE-PAGE-EDIT-A\n',
+    name: '自定义模式',
+    baseN: String(baseN),
+  }))
+  check('数字字符串不算 baseN，保存仍 200', asString.statusCode === 200 && JSON.parse(asString.body).ok === true, asString.body.slice(0, 120))
+  const afterString = JSON.parse((await call(makeReq('GET', { url: '/custom-mode/state?id=custom' }))).body)
+  check('数字字符串那次把外部文本留在历史里', afterString.history.some((entry) => entry.preview === 'EXTERNAL-EDIT-C'), JSON.stringify(afterString.history.map((entry) => entry.preview)))
+
+  const current = afterString.history[0]?.n
+  const again = await call(post('/custom-mode/state', {
+    id: 'custom',
+    mode: 'standard',
+    prompt: '正常再存一版\n',
+    name: '自定义模式',
+    baseN: current,
+  }))
+  check('与磁盘一致的 baseN 保存仍是 200', again.statusCode === 200 && JSON.parse(again.body).ok === true, again.body.slice(0, 140))
+  check('正常保存写入了新文本', readFileSync(promptPath, 'utf8') === '正常再存一版\n', JSON.stringify(readFileSync(promptPath, 'utf8')))
+}
+
+console.log()
+console.log('=== 5.7 降级保存使用同一条冲突规则 ===')
+{
+  const degraded = join(userRoot, 'degraded-only')
+  mkdirSync(degraded, { recursive: true })
+  writeFileSync(join(degraded, 'prompt.md'), '降级基线\n', 'utf8')
+  const journal = await import('../journal.mjs')
+  const seeded = editor.savePromptOnly(degraded, {
+    id: 'degraded-only',
+    mode: 'standard',
+    prompt: '降级基线\n',
+    name: '',
+    description: '',
+    displayName: 'degraded-only',
+  })
+  check('降级保存基线成功', seeded.ok === true && seeded.code === 'savedPromptOnly', JSON.stringify(seeded))
+  const seededN = journal.listHistory(degraded)[0]?.n
+  writeFileSync(join(degraded, 'prompt.md'), 'EXTERNAL-DEGRADED\n', 'utf8')
+  const conflict = editor.savePromptOnly(degraded, {
+    id: 'degraded-only',
+    mode: 'standard',
+    prompt: 'STALE-DEGRADED\n',
+    name: '',
+    description: '',
+    displayName: 'degraded-only',
+    baseN: seededN,
+  })
+  check('降级路径的过期 baseN 返回 conflict', conflict.ok === false && conflict.code === 'conflict', JSON.stringify(conflict))
+  check('降级冲突不改 prompt.md', readFileSync(join(degraded, 'prompt.md'), 'utf8') === 'EXTERNAL-DEGRADED\n', JSON.stringify(readFileSync(join(degraded, 'prompt.md'), 'utf8')))
+  check(
+    '降级冲突把外部文本记进历史',
+    journal.listHistory(degraded).some((entry) => entry.preview === 'EXTERNAL-DEGRADED' && entry.by === 'external'),
+    JSON.stringify(journal.listHistory(degraded)),
+  )
+  const plain = editor.savePromptOnly(degraded, {
+    id: 'degraded-only',
+    mode: 'standard',
+    prompt: 'STALE-DEGRADED\n',
+    name: '',
+    description: '',
+    displayName: 'degraded-only',
+  })
+  check('降级保存不带 baseN 仍写入', plain.ok === true && plain.code === 'savedPromptOnly', JSON.stringify(plain))
+  check('降级不带 baseN 后磁盘是页面文本', readFileSync(join(degraded, 'prompt.md'), 'utf8') === 'STALE-DEGRADED\n')
+  check('降级不带 baseN 后历史仍能看到外部文本', journal.listHistory(degraded).some((entry) => entry.preview === 'EXTERNAL-DEGRADED'))
+}
+
+rmSync(dir, { recursive: true, force: true })
+
+console.log()
+console.log(`结果: ${passed} 通过, ${failed} 失败`)
+process.exit(failed === 0 ? 0 : 1)
