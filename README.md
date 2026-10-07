@@ -10,8 +10,10 @@
 ## 安装
 
 ```bash
-dsh plugin --profile web add github:GemChance/dsh-chinese-minimal-mode
+dsh plugin --profile web add https://codeload.github.com/GemChance/dsh-chinese-minimal-mode/tar.gz/refs/tags/v1.0.0
 ```
+
+这个 tarball 地址也适用于只能通过 HTTPS 代理访问 GitHub、但 Git smart HTTP 被代理拦截的服务器。
 
 安装后重启 DSH Web：
 
@@ -36,7 +38,7 @@ dsh web --no-open
 ## 更新
 
 ```bash
-dsh plugin --profile web add github:GemChance/dsh-chinese-minimal-mode
+dsh plugin --profile web add https://codeload.github.com/GemChance/dsh-chinese-minimal-mode/tar.gz/refs/tags/v1.0.0
 ```
 
 ## 卸载
