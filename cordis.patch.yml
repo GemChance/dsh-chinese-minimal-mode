@@ -1,0 +1,51 @@
+# Register an additional Web agent preset. It follows the official Minimal
+# composition: a complete persona plus one persistent platform shell.
+- insert:
+    - id: preset-chinese-minimal
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: chinese-minimal
+        name: 中文极简模式
+        description: 极简工具集；完整系统提示词由 ~/.dsh/prompts/chinese-assistant.md 指定。
+        order: 5
+        plugins:
+          - id: persona
+            name: 'dsh-chinese-minimal-mode/prompt-reader'
+            config:
+              complete: true
+              includeRuntimeContext: false
+          - id: persistent-shell
+            name: cordis:group
+            group: true
+            isolate:
+              terminals: true
+            config:
+              - id: pty
+                name: '@deepseek-ai/dsh-terminal'
+              - id: terminal-bash
+                name: '@deepseek-ai/dsh-terminal-bash'
+                disabled: !!js process.platform === 'win32'
+                config:
+                  timeoutMs: 300000
+              - id: persistent-bash
+                name: '@deepseek-ai/dsh-tool-bash-persistent'
+                disabled: !!js process.platform === 'win32'
+                config:
+                  timeoutMs: 300000
+                  description: |-
+                    Run commands in a persistent bash shell.
+                    Keep output concise and run long-lived processes in the background.
+              - id: terminal-pwsh
+                name: '@deepseek-ai/dsh-terminal-bash'
+                disabled: !!js process.platform !== 'win32'
+                config:
+                  shellDialect: pwsh
+                  timeoutMs: 300000
+              - id: persistent-pwsh
+                name: '@deepseek-ai/dsh-tool-pwsh-persistent'
+                disabled: !!js process.platform !== 'win32'
+                config:
+                  timeoutMs: 300000
+                  description: |-
+                    Run commands in a persistent PowerShell session.
+                    Keep output concise and run long-lived processes in the background.

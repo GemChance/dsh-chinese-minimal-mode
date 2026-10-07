@@ -1,0 +1,58 @@
+{
+  "name": "dsh-chinese-minimal-mode",
+  "version": "1.0.0",
+  "description": "A DeepSeek Harness Minimal preset whose complete system prompt is loaded from an editable Markdown file.",
+  "license": "MIT",
+  "type": "module",
+  "author": "GemChance",
+  "main": "./prompt-reader.mjs",
+  "exports": {
+    ".": "./prompt-reader.mjs",
+    "./prompt-reader": "./prompt-reader.mjs",
+    "./package.json": "./package.json"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GemChance/dsh-chinese-minimal-mode.git"
+  },
+  "homepage": "https://github.com/GemChance/dsh-chinese-minimal-mode#readme",
+  "bugs": {
+    "url": "https://github.com/GemChance/dsh-chinese-minimal-mode/issues"
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "agent-preset",
+    "minimal-mode",
+    "system-prompt"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "cordis.patch.yml",
+    "default-prompt.md",
+    "prompt-reader.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.0-0 <0.3.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.0-0 <0.3.0-0"
+  }
+}
